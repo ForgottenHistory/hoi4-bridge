@@ -11,6 +11,7 @@ From Python:
 No window focus or keyboard input is involved; the game does not even need to be in the foreground.
 """
 
+import codecs
 import ctypes
 import os
 import sys
@@ -54,6 +55,20 @@ def _open(connect_timeout: float):
         time.sleep(0.05)
 
 
+def _cp1252_fallback(err: UnicodeDecodeError):
+    return err.object[err.start:err.end].decode("cp1252", "replace"), err.end
+
+
+codecs.register_error("hoi4bridge_cp1252", _cp1252_fallback)
+
+
+def _decode(data: bytes) -> str:
+    """Replies are UTF-8, but the game mixes encodings inside its own text (localisation is
+    Windows-1252, character names UTF-8) and older bridge builds passed that through unconverted.
+    Valid UTF-8 sequences decode as UTF-8; any other byte is read as Windows-1252."""
+    return data.decode("utf-8", "hoi4bridge_cp1252")
+
+
 def _request(payload: bytes, connect_timeout: float) -> str:
     h = _open(connect_timeout)
     try:
@@ -69,14 +84,20 @@ def _request(payload: bytes, connect_timeout: float) -> str:
                 break
             if ctypes.get_last_error() != _ERROR_MORE_DATA:
                 raise BridgeUnavailable(f"read failed: {ctypes.get_last_error()}")
-        return out.decode("utf-8", "replace")
+        return _decode(bytes(out))
     finally:
         _k32.CloseHandle(h)
 
 
 def send(*commands: str, connect_timeout: float = 2.0) -> list[str]:
     """Run console (or bridge.*) commands; one reply line per command."""
-    return _request("\n".join(commands).encode("utf-8"), connect_timeout).splitlines()
+    # Split on "\n" only: str.splitlines() would also split on characters replies may contain
+    # (\x1c-\x1e separators, \x85,   in localised text).
+    reply = _request("\n".join(commands).encode("utf-8"), connect_timeout)
+    lines = reply.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line.rstrip("\r") for line in lines]
 
 
 def setloc(key: str, text: str) -> str:

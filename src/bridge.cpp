@@ -508,6 +508,30 @@ static std::string EscapeLine(const std::string& s) {
     for (char c : s) { if (c == '\\') o += "\\\\"; else if (c == '\n') o += "\\n"; else if (c != '\r') o += c; }
     return o;
 }
+// Replies are UTF-8, but the game mixes encodings inside its own text: localisation is Windows-1252, while
+// character names (from save data) are UTF-8, and one formatted line can hold both. Valid UTF-8 sequences are
+// kept; any other byte is read as Windows-1252.
+static size_t Utf8SeqLen(const unsigned char* p, size_t left) {
+    unsigned char c = p[0];
+    size_t n = c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 : c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+    if (!n || n > left) return 0;
+    for (size_t i = 1; i < n; i++) if ((p[i] & 0xC0) != 0x80) return 0;
+    return n;
+}
+static std::string Cp1252ToUtf8(const char* s, size_t n) {
+    std::string out; out.reserve(n + n / 8);
+    auto* p = (const unsigned char*)s;
+    for (size_t i = 0; i < n;) {
+        if (p[i] < 0x80) { out += (char)p[i++]; continue; }
+        size_t len = Utf8SeqLen(p + i, n - i);
+        if (len) { out.append(s + i, len); i += len; continue; }
+        wchar_t w = 0;
+        MultiByteToWideChar(1252, 0, s + i, 1, &w, 1);
+        AppendUtf8(out, w ? (uint32_t)w : 0xFFFD);
+        i++;
+    }
+    return out;
+}
 static std::string UnescapeLine(const std::string& s) {
     std::string o; o.reserve(s.size());
     for (size_t i = 0; i < s.size(); i++) {
@@ -554,7 +578,56 @@ static std::string EditBoxCommand(const std::string& sub, const std::string& arg
     return "FAIL unknown editbox command";
 }
 
+static std::string Query(const std::string& effect);   // log capture, below
+
+// ---------------------------------------------------------------- localisation lookup (bridge.loc)
+// Localize(std::string* out, const char* key, args, nargs) (clausewitz localize.cpp), as used by the game's own
+// UI code. The result string is left to leak (it was allocated by the game's allocator); lookups are small.
+using LocalizeFn = MsvcString*(__fastcall*)(MsvcString* out, const char* key, void* args, int nargs);
+static LocalizeFn g_localize;
+
+static bool ScanLocalize() {
+    uint8_t* p = FindPattern(g_textStart, g_textEnd,
+        "48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 50 45 33 FF 41 8B E9 44 38 3D ?? ?? ?? ?? 4D 8B F0 48 8B F2 48 8B F9 74 ??");
+    if (!p) { Log("localize scan: pattern missing; bridge.loc disabled"); return false; }
+    g_localize = (LocalizeFn)p;
+    Log("localize scan: localize=hoi4+%#llx", (unsigned long long)(p - g_base));
+    return true;
+}
+// Copies the localised text into out (up to cap-1 bytes). Returns false on a crash inside the game.
+static bool RawLocalize(const char* key, char* out, size_t cap) {
+    __try {
+        MsvcString s = {};
+        g_localize(&s, key, nullptr, 0);
+        size_t n = s.size < cap - 1 ? s.size : cap - 1;
+        memcpy(out, StrData(&s), n); out[n] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// bridge.loc KEY [KEY ...] -> values separated by \x1e, each escaped like other one-line replies.
+static std::string LocLookup(const std::string& args) {
+    if (!g_localize) return "ERROR localisation lookup not active (see console_bridge.log)";
+    std::vector<char> buf(64 * 1024);
+    std::string out = "OK ";
+    size_t pos = 0; bool first = true;
+    while (pos < args.size()) {
+        size_t s = args.find_first_not_of(" \t", pos);
+        if (s == std::string::npos) break;
+        size_t e = args.find_first_of(" \t", s);
+        if (e == std::string::npos) e = args.size();
+        std::string key = args.substr(s, e - s);
+        pos = e;
+        if (!first) out += '\x1e';
+        first = false;
+        if (!RawLocalize(key.c_str(), buf.data(), buf.size())) return "ERROR crash looking up " + key;
+        out += EscapeLine(Cp1252ToUtf8(buf.data(), strlen(buf.data())));
+    }
+    return first ? "FAIL usage: bridge.loc KEY [KEY ...]" : out;
+}
+
 static std::string HandleBridgeCommand(const std::string& cmd) {
+    if (cmd.rfind("bridge.query ", 0) == 0) return Query(cmd.substr(13));
+    if (cmd.rfind("bridge.loc ", 0) == 0) return LocLookup(cmd.substr(11));
     if (cmd == "bridge.editbox.list") return EditBoxCommand("list", "");
     if (cmd.rfind("bridge.editbox.set ", 0) == 0) return EditBoxCommand("set", cmd.substr(19));
     if (cmd.rfind("bridge.editbox ", 0) == 0) {
@@ -644,6 +717,89 @@ static std::deque<std::shared_ptr<Job>> g_queue;
 
 static volatile DWORD g_frameThread = 0;
 static volatile bool  g_ready = false;   // patterns found and hooks on
+
+// ---------------------------------------------------------------- log capture (bridge.query)
+// Script's `log = "..."` effect (effectbase.cpp) builds a CLogStream; its destructor hands the finished line to
+// the global logger: logger->vtable[1](logger, flags, const std::string* file, int line, const std::string* text).
+// We hook that sink. While bridge.query runs an effect on the frame thread, every line logged is also captured
+// and returned to the client, so script can answer questions (names, leaders, loops over countries or states)
+// directly, formatted by the game's own localisation. Lines still reach game.log as usual.
+using LogSinkFn   = void(__fastcall*)(void* logger, unsigned flags, const MsvcString* file, int line, const MsvcString* text);
+using GetLoggerFn = void*(__fastcall*)();
+static GetLoggerFn g_getLogger;
+static void**      g_loggerSlot;
+static LogSinkFn   o_logSink;
+static bool        g_logScanned = false, g_logHooked = false;
+static bool        g_capturing = false;              // only touched on the frame thread
+static std::vector<std::string> g_captured;
+
+static bool ScanLog() {
+    uint8_t* p = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 10 57 48 83 EC 20 33 FF 48 8B 05 ?? ?? ?? ?? 48 85 C0 0F 85 ?? ?? ?? ?? B9 48 00 00 00 E8 ?? ?? ?? ?? 48 8B D8 48 89 44 24 30");
+    if (!p) { Log("log scan: GetLogger pattern missing; bridge.query disabled"); return false; }
+    g_getLogger  = (GetLoggerFn)p;
+    g_loggerSlot = (void**)Rel32(p + 0xc, 3, 7);
+    Log("log scan: getLogger=hoi4+%#llx slot=hoi4+%#llx", (unsigned long long)(p - g_base),
+        (unsigned long long)((uint8_t*)g_loggerSlot - g_base));
+    return true;
+}
+
+static void __fastcall hk_logSink(void* logger, unsigned flags, const MsvcString* file, int line, const MsvcString* text) {
+    if (g_capturing && text && GetCurrentThreadId() == g_frameThread) {
+        size_t n = text->size;
+        const char* d = StrData(text);
+        while (n && (d[n - 1] == '\n' || d[n - 1] == '\r')) n--;   // the log stream ends each line with \n
+        g_captured.push_back(Cp1252ToUtf8(d, n));
+    }
+    o_logSink(logger, flags, file, line, text);
+}
+
+// Hooked lazily on the frame thread: the game creates the logger on first use.
+static void* RawLoggerSinkAddr() {
+    __try {
+        void* logger = *g_loggerSlot ? *g_loggerSlot : g_getLogger();
+        if (!logger) return nullptr;
+        void* fn = (*(void***)logger)[1];
+        return InGameCode(fn) ? fn : nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+static bool EnsureLogHook() {
+    if (g_logHooked) return true;
+    if (!g_logScanned) return false;
+    void* sink = RawLoggerSinkAddr();
+    if (!sink) { Log("log hook: logger not available"); return false; }
+    if (MH_CreateHook(sink, &hk_logSink, (void**)&o_logSink) != MH_OK || MH_EnableHook(sink) != MH_OK) {
+        Log("log hook FAILED"); g_logScanned = false; return false;
+    }
+    g_logHooked = true;
+    Log("log hook on: sink=hoi4+%#llx", (unsigned long long)((uint8_t*)sink - g_base));
+    return true;
+}
+
+// Runs `eval_effect <effect>` and returns the lines it logged, separated by \x1e (record separator).
+// Line breaks inside a line are escaped (\n, \\), so the reply stays one line.
+static std::string Query(const std::string& effect) {
+    if (!EnsureLogHook()) return "ERROR log capture not active (see console_bridge.log)";
+    std::string cmd = "eval_effect " + effect;
+    char msg[2048];
+    g_captured.clear();
+    g_capturing = true;
+    int rc = RawExecute(cmd.data(), cmd.size(), msg, sizeof msg);
+    g_capturing = false;
+    std::vector<std::string> lines;
+    lines.swap(g_captured);
+    if (rc < 0) return std::string("ERROR ") + msg;
+    if (rc == 0) {
+        for (char* q = msg; *q; q++) if (*q == '\r' || *q == '\n') *q = ' ';
+        return std::string("FAIL ") + msg;
+    }
+    std::string out = "OK ";
+    for (size_t i = 0; i < lines.size(); i++) {
+        if (i) out += '\x1e';
+        out += EscapeLine(lines[i]);
+    }
+    return out;
+}
 
 static void RunQueued() {
     for (int i = 0; i < kMaxPerFrame; i++) {
@@ -793,6 +949,8 @@ static DWORD WINAPI InitThread(void*) {
         else Log("console watch hook failed (not needed to run commands)");
         g_locReady = ScanLoc();
         g_dataReady = ScanData();
+        g_logScanned = ScanLog();
+        ScanLocalize();
         if (ScanEditBox()) {
             g_ebReady = MH_CreateHook((void*)g_ebInsert, &hk_ebInsert, (void**)&o_ebInsert) == MH_OK &&
                         MH_CreateHook((void*)g_ebDtor, &hk_ebDtor, (void**)&o_ebDtor) == MH_OK &&

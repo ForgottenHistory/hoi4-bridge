@@ -36,6 +36,12 @@ The DLL logs to `console_bridge.log` in the HOI4 folder.
 | `bridge.setloc KEY text` | set one localisation key (`\n` = line break) |
 | `bridge.reloadloc <abs path>` | re-read one `.yml` file |
 | `bridge.locinfo` | localisation buffer usage |
+| `bridge.query <effect>` | run an effect (`TAG = { ... }`) and return the lines its `log = "..."` statements print, separated by `\x1e` |
+| `bridge.loc KEY [KEY ...]` | localised text of each key, separated by `\x1e` (a missing key comes back unchanged) |
+
+`bridge.query` makes script a query language: `log` formats with the game's own localisation, so
+`GER = { every_neighbor_country = { log = "[THIS.GetTag] [THIS.GetLeader]" } }` returns one line per neighbour.
+It hooks the game's logger, so the lines also still reach game.log.
 | `bridge.editbox NAME` | text of the GUI text box with that .gui name (`\n` = line break, `\\` = backslash) |
 | `bridge.editbox.set NAME [text]` | replace that text box's text (no text = clear it) |
 | `bridge.editbox.list` | text boxes seen so far, open or closed |
