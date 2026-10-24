@@ -385,7 +385,183 @@ static std::string DumpCountry(std::string tag) {
     return "OK \t" + tag + "={\n" + buf + "\t}";
 }
 
+// ---------------------------------------------------------------- edit boxes
+// CEditBox (clausewitz editboxtype.cpp) holds its text buffer as a subobject at +0x80. The buffer stores the text
+// as a std::u32string at +0x30 (size +0x40, capacity +0x48; inline when capacity <= 3). Every change that adds
+// text goes through Insert(buffer, const u32string*): typing, paste and SetText(buffer, const char* utf8).
+// Vtable slot 0xa8 of the box returns its .gui name (const std::string*).
+//
+// We hook Insert to learn which box has which name, and the destructor to keep the last text of a box that
+// closes (a popup's Send button may close it before a client asks). Boxes that only had characters deleted are
+// still read live, so the text is always current while the box exists.
+struct U32String { union { uint32_t buf[4]; uint32_t* ptr; }; size_t size; size_t cap; };
+using EbInsertFn  = void(__fastcall*)(void* buffer, void* text);
+using EbSetTextFn = void(__fastcall*)(void* buffer, const char* utf8);
+using EbDtorFn    = void*(__fastcall*)(void* box, unsigned flags);
+static EbInsertFn  g_ebInsert, o_ebInsert;
+static EbSetTextFn g_ebSetText;
+static EbDtorFn    g_ebDtor, o_ebDtor;
+static void*       g_editBoxVt;
+static bool        g_ebReady = false;
+
+struct TrackedBox { void* box = nullptr; std::string text; };   // box == nullptr once destroyed
+static std::recursive_mutex g_ebLock;                           // re-entered when our SetText runs Insert
+static std::vector<std::pair<std::string, TrackedBox>> g_boxes;    // by name; few entries
+
+static bool ScanEditBox() {
+    uint8_t *ts = g_textStart, *te = g_textEnd;
+    uint8_t* ins = FindPattern(ts, te, "48 89 74 24 18 57 48 83 EC 40 83 7A 10 01 48 8B F2 48 8B F9 75 ?? 48 8B 81 D8 00 00 00 48 85 C0 74 ?? 48 8B 52 18 48 8B CE 48 83 FA 03 76 ??");
+    uint8_t* set = FindPattern(ts, te, "48 89 5C 24 10 57 48 83 EC 40 48 8B D9 0F 57 C0 0F 11 44 24 20 66 0F 6F 0D ?? ?? ?? ?? F3 0F 7F 4C 24 30 33 FF 89 7C 24 20 48 8D 4C 24 20");
+    uint8_t* dtor = FindPattern(ts, te, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 8B EA 48 8B D9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 81 80 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 81 A0 01 00 00");
+    if (!ins || !set || !dtor) { Log("editbox scan: pattern missing (%p %p %p); editbox support disabled", ins, set, dtor); return false; }
+    g_ebInsert  = (EbInsertFn)ins;
+    g_ebSetText = (EbSetTextFn)set;
+    g_ebDtor    = (EbDtorFn)dtor;
+    g_editBoxVt = Rel32(dtor + 0x19, 3, 7);                     // lea rax, [CEditBox::vftable]
+    Log("editbox scan: insert=hoi4+%#llx settext=hoi4+%#llx dtor=hoi4+%#llx vftable=hoi4+%#llx",
+        (unsigned long long)(ins - g_base), (unsigned long long)(set - g_base), (unsigned long long)(dtor - g_base),
+        (unsigned long long)((uint8_t*)g_editBoxVt - g_base));
+    return true;
+}
+
+// SEH-only helpers. name gets the box's .gui name; returns false if p isn't a CEditBox.
+static bool RawBoxName(void* box, char* name, size_t cap) {
+    __try {
+        if (*(void**)box != g_editBoxVt) return false;
+        auto getName = (const MsvcString*(__fastcall*)(void*))(*(void***)box)[0xa8 / 8];
+        if (!InGameCode((void*)getName)) return false;
+        const MsvcString* s = getName(box);
+        if (!s || s->size == 0 || s->size >= cap) return false;
+        memcpy(name, StrData(s), s->size); name[s->size] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Copies up to cap UTF-32 code points; returns the count, or -1 if the box can't be read.
+static long long RawBoxText(void* box, uint32_t* out, size_t cap) {
+    __try {
+        if (*(void**)box != g_editBoxVt) return -1;
+        auto* s = (U32String*)((uint8_t*)box + 0x80 + 0x30);
+        size_t n = s->size;
+        if (n > cap) n = cap;
+        const uint32_t* d = s->cap > 3 ? s->ptr : s->buf;
+        memcpy(out, d, n * 4);
+        return (long long)n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static bool RawBoxSetText(void* box, const char* utf8) {
+    __try {
+        if (*(void**)box != g_editBoxVt) return false;
+        g_ebSetText((uint8_t*)box + 0x80, utf8);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void AppendUtf8(std::string& out, uint32_t c) {
+    if (c < 0x80) out += (char)c;
+    else if (c < 0x800) { out += (char)(0xC0 | (c >> 6)); out += (char)(0x80 | (c & 0x3F)); }
+    else if (c < 0x10000) { out += (char)(0xE0 | (c >> 12)); out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+    else if (c < 0x110000) { out += (char)(0xF0 | (c >> 18)); out += (char)(0x80 | ((c >> 12) & 0x3F));
+                             out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
+}
+static bool ReadBoxUtf8(void* box, std::string& out) {
+    std::vector<uint32_t> tmp(16384);
+    long long n = RawBoxText(box, tmp.data(), tmp.size());
+    if (n < 0) return false;
+    out.clear();
+    for (long long i = 0; i < n; i++) AppendUtf8(out, tmp[i]);
+    return true;
+}
+static TrackedBox* FindBox(const std::string& name) {          // caller holds g_ebLock
+    for (auto& e : g_boxes) if (e.first == name) return &e.second;
+    return nullptr;
+}
+
+static void __fastcall hk_ebInsert(void* buffer, void* text) {
+    o_ebInsert(buffer, text);
+    void* box = (uint8_t*)buffer - 0x80;
+    char name[128];
+    if (!RawBoxName(box, name, sizeof name)) return;
+    std::string utf8;
+    if (!ReadBoxUtf8(box, utf8)) return;
+    std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+    TrackedBox* t = FindBox(name);
+    if (!t) { g_boxes.push_back({ name, TrackedBox() }); t = &g_boxes.back().second; Log("editbox: tracking \"%s\"", name); }
+    t->box = box;
+    t->text = std::move(utf8);
+}
+static void* __fastcall hk_ebDtor(void* box, unsigned flags) {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+        for (auto& e : g_boxes) {
+            if (e.second.box != box) continue;
+            std::string last;
+            if (ReadBoxUtf8(box, last)) e.second.text = std::move(last);
+            e.second.box = nullptr;
+        }
+    }
+    return o_ebDtor(box, flags);
+}
+
+// Replies are one line: backslash and line breaks are escaped (\\ \n).
+static std::string EscapeLine(const std::string& s) {
+    std::string o; o.reserve(s.size() + 8);
+    for (char c : s) { if (c == '\\') o += "\\\\"; else if (c == '\n') o += "\\n"; else if (c != '\r') o += c; }
+    return o;
+}
+static std::string UnescapeLine(const std::string& s) {
+    std::string o; o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) { char n = s[++i]; o += n == 'n' ? '\n' : n; }
+        else o += s[i];
+    }
+    return o;
+}
+
+static std::string EditBoxCommand(const std::string& sub, const std::string& args) {
+    if (!g_ebReady) return "ERROR editbox support not active (see console_bridge.log)";
+    if (sub == "list") {
+        std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+        std::string o = "OK";
+        for (auto& e : g_boxes) o += " " + e.first + (e.second.box ? "(open)" : "(closed)");
+        return o;
+    }
+    std::string name = args, value;
+    size_t sp = args.find_first_of(" \t");
+    if (sp != std::string::npos) {
+        name = args.substr(0, sp);
+        size_t v = args.find_first_not_of(" \t", sp);
+        if (v != std::string::npos) value = args.substr(v);
+    }
+    if (name.empty()) return "FAIL usage: bridge.editbox NAME | bridge.editbox.set NAME [text] | bridge.editbox.list";
+    std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+    TrackedBox* t = FindBox(name);
+    if (sub == "get") {
+        if (!t) return "OK ";                                        // never typed into: empty
+        if (t->box) { std::string live; if (ReadBoxUtf8(t->box, live)) t->text = std::move(live); else t->box = nullptr; }
+        return "OK " + EscapeLine(t->text);
+    }
+    if (sub == "set") {
+        std::string text = UnescapeLine(value);
+        if (!t) return "OK not open yet; nothing to change";
+        t->text = text;
+        if (!t->box) return "OK box is closed; stored text changed";
+        if (!RawBoxSetText(t->box, text.c_str())) {
+            if ((t = FindBox(name)) != nullptr) t->box = nullptr;   // our Insert hook ran inside; re-find
+            return "FAIL box could not be changed";
+        }
+        return "OK";
+    }
+    return "FAIL unknown editbox command";
+}
+
 static std::string HandleBridgeCommand(const std::string& cmd) {
+    if (cmd == "bridge.editbox.list") return EditBoxCommand("list", "");
+    if (cmd.rfind("bridge.editbox.set ", 0) == 0) return EditBoxCommand("set", cmd.substr(19));
+    if (cmd.rfind("bridge.editbox ", 0) == 0) {
+        std::string n = cmd.substr(15);
+        while (!n.empty() && (n.back() == ' ' || n.back() == '\t')) n.pop_back();
+        return EditBoxCommand("get", n);
+    }
     if (cmd == "bridge.player") {
         if (!g_dataReady) return "ERROR country data support not active";
         const char* t = RawPlayerTag();
@@ -420,7 +596,8 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
         if (!ParseLocFile(path, kv, err)) return "FAIL " + err;
         return ApplyLoc(kv, path.c_str());
     }
-    return "FAIL unknown bridge command (bridge.locinfo, bridge.setloc KEY text, bridge.reloadloc <file>)";
+    return "FAIL unknown bridge command (bridge.locinfo, bridge.setloc KEY text, bridge.reloadloc <file>, "
+           "bridge.editbox NAME, bridge.editbox.set NAME [text], bridge.editbox.list)";
 }
 
 // ---------------------------------------------------------------- running one command
@@ -616,6 +793,12 @@ static DWORD WINAPI InitThread(void*) {
         else Log("console watch hook failed (not needed to run commands)");
         g_locReady = ScanLoc();
         g_dataReady = ScanData();
+        if (ScanEditBox()) {
+            g_ebReady = MH_CreateHook((void*)g_ebInsert, &hk_ebInsert, (void**)&o_ebInsert) == MH_OK &&
+                        MH_CreateHook((void*)g_ebDtor, &hk_ebDtor, (void**)&o_ebDtor) == MH_OK &&
+                        MH_EnableHook((void*)g_ebInsert) == MH_OK && MH_EnableHook((void*)g_ebDtor) == MH_OK;
+            Log(g_ebReady ? "editbox hooks on" : "editbox hooks FAILED");
+        }
     } else {
         Log("patterns not found: this game version needs new patterns. Bridge disabled.");
     }

@@ -36,6 +36,12 @@ The DLL logs to `console_bridge.log` in the HOI4 folder.
 | `bridge.setloc KEY text` | set one localisation key (`\n` = line break) |
 | `bridge.reloadloc <abs path>` | re-read one `.yml` file |
 | `bridge.locinfo` | localisation buffer usage |
+| `bridge.editbox NAME` | text of the GUI text box with that .gui name (`\n` = line break, `\\` = backslash) |
+| `bridge.editbox.set NAME [text]` | replace that text box's text (no text = clear it) |
+| `bridge.editbox.list` | text boxes seen so far, open or closed |
+
+Text boxes are found by hooking the game's text insert function, so a box is known once something has
+been typed, pasted or set into it. Its last text is kept after it closes.
 
 ### Useful built-in console commands
 
