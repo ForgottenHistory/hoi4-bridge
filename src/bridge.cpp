@@ -407,6 +407,24 @@ static bool        g_ebReady = false;
 struct TrackedBox { void* box = nullptr; std::string text; };   // box == nullptr once destroyed
 static std::recursive_mutex g_ebLock;                           // re-entered when our SetText runs Insert
 static std::vector<std::pair<std::string, TrackedBox>> g_boxes;    // by name; few entries
+// Text buffer flag +0xf0 (box+0x80+0xf0): Enter inserts "\n" when set, otherwise it only notifies observers.
+// The buffer constructor clears it, only the Enter handler reads it, and .gui editBoxType can't set it, so
+// bridge.editbox.multiline NAME does. The text box itself still draws one line (the one with the cursor);
+// show the whole text elsewhere with bridge.editbox.mirror.
+static const size_t kEbEnterNewline = 0x80 + 0xf0;
+static std::vector<std::string> g_multilineNames;
+
+// Mirrors: show a text box's whole text in an instant text box (which wraps and draws many lines).
+// CInstantTextBox::SetText(box, std::string by value) is hooked to learn the page's address by its .gui
+// name; every frame, a changed text is set on the page through the same function.
+// original: the text the game itself last gave the page (its .gui text), shown while the box is empty.
+struct Mirror { std::string box, page, original; void* pagePtr = nullptr; std::string shown; bool dirty = true; };
+static std::vector<Mirror> g_mirrors;                                    // guarded by g_ebLock
+using TbSetTextFn = void(__fastcall*)(void* textbox, MsvcString* byValue);   // callee frees the string
+using StrCopyFn   = MsvcString*(__fastcall*)(MsvcString* dst, const MsvcString* src);
+static TbSetTextFn g_tbSetText, o_tbSetText;
+static StrCopyFn   g_strCopy;                    // the game's std::string copy: its allocator owns the result
+static bool        g_tbReady = false, g_inMirrorSet = false;
 
 static bool ScanEditBox() {
     uint8_t *ts = g_textStart, *te = g_textEnd;
@@ -448,6 +466,39 @@ static long long RawBoxText(void* box, uint32_t* out, size_t cap) {
         return (long long)n;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
+static bool RawBoxSetMultiline(void* box, bool on) {
+    __try {
+        if (*(void**)box != g_editBoxVt) return false;
+        ((uint8_t*)box)[kEbEnterNewline] = on ? 1 : 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool IsMultilineName(const char* name) {               // caller holds g_ebLock
+    for (auto& n : g_multilineNames) if (n == name) return true;
+    return false;
+}
+// .gui name of any GUI object (vtable slot 0xa8 is the same getter for all of them).
+static bool RawGuiName(void* obj, char* name, size_t cap) {
+    __try {
+        auto getName = (const MsvcString*(__fastcall*)(void*))(*(void***)obj)[0xa8 / 8];
+        if (!InGameCode((void*)getName)) return false;
+        const MsvcString* s = getName(obj);
+        if (!s || s->size == 0 || s->size >= cap) return false;
+        memcpy(name, StrData(s), s->size); name[s->size] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool RawPageSetText(void* page, const char* data, size_t n) {
+    __try {
+        MsvcString src = {}, dst = {};
+        if (n < 16) { memcpy(src.buf, data, n); src.buf[n] = 0; src.cap = 15; }
+        else { src.ptr = (char*)data; src.cap = n; }
+        src.size = n;
+        g_strCopy(&dst, &src);
+        g_tbSetText(page, &dst);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 static bool RawBoxSetText(void* box, const char* utf8) {
     __try {
         if (*(void**)box != g_editBoxVt) return false;
@@ -463,8 +514,16 @@ static void AppendUtf8(std::string& out, uint32_t c) {
     else if (c < 0x110000) { out += (char)(0xF0 | (c >> 18)); out += (char)(0x80 | ((c >> 12) & 0x3F));
                              out += (char)(0x80 | ((c >> 6) & 0x3F)); out += (char)(0x80 | (c & 0x3F)); }
 }
+static long long RawBoxLen(void* box) {
+    __try {
+        if (*(void**)box != g_editBoxVt) return -1;
+        return (long long)((U32String*)((uint8_t*)box + 0x80 + 0x30))->size;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 static bool ReadBoxUtf8(void* box, std::string& out) {
-    std::vector<uint32_t> tmp(16384);
+    long long len = RawBoxLen(box);
+    if (len < 0) return false;
+    std::vector<uint32_t> tmp((size_t)(len < 65536 ? len : 65536) + 1);
     long long n = RawBoxText(box, tmp.data(), tmp.size());
     if (n < 0) return false;
     out.clear();
@@ -488,10 +547,14 @@ static void __fastcall hk_ebInsert(void* buffer, void* text) {
     if (!t) { g_boxes.push_back({ name, TrackedBox() }); t = &g_boxes.back().second; Log("editbox: tracking \"%s\"", name); }
     t->box = box;
     t->text = std::move(utf8);
+    if (IsMultilineName(name)) RawBoxSetMultiline(box, true);
 }
 static void* __fastcall hk_ebDtor(void* box, unsigned flags) {
     {
         std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+        char name[128];
+        if (!g_mirrors.empty() && RawBoxName(box, name, sizeof name))
+            for (auto& m : g_mirrors) if (m.box == name) { m.pagePtr = nullptr; m.dirty = true; }
         for (auto& e : g_boxes) {
             if (e.second.box != box) continue;
             std::string last;
@@ -500,6 +563,78 @@ static void* __fastcall hk_ebDtor(void* box, unsigned flags) {
         }
     }
     return o_ebDtor(box, flags);
+}
+
+// Pages are drawn from the game's own encoding (Windows-1252); colour-code markers are dropped.
+static std::string Utf8ToGameText(const std::string& u) {
+    if (u.empty()) return u;
+    int wn = MultiByteToWideChar(CP_UTF8, 0, u.data(), (int)u.size(), nullptr, 0);
+    std::wstring w(wn, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, u.data(), (int)u.size(), &w[0], wn);
+    w.erase(std::remove(w.begin(), w.end(), L'\u00a7'), w.end());
+    int n = WideCharToMultiByte(1252, 0, w.data(), (int)w.size(), nullptr, 0, "?", nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(1252, 0, w.data(), (int)w.size(), &out[0], n, "?", nullptr);
+    return out;
+}
+
+static bool RawCopyText(const MsvcString* s, std::vector<char>& buf, size_t* n) {
+    __try {
+        *n = s->size < buf.size() ? s->size : buf.size();
+        memcpy(buf.data(), StrData(s), *n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void __fastcall hk_tbSetText(void* textbox, MsvcString* text) {
+    // The callee frees `text`, so look at it before calling the original.
+    if (!g_inMirrorSet && text) {
+        std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+        char name[128];
+        if (!g_mirrors.empty() && RawGuiName(textbox, name, sizeof name)) {
+            for (auto& m : g_mirrors) {
+                if (m.page != name) continue;
+                std::vector<char> buf(8192); size_t n = 0;
+                if (RawCopyText(text, buf, &n)) m.original.assign(buf.data(), n);
+                m.pagePtr = textbox;
+                m.dirty = true;                                       // (re)applied next frame
+            }
+        }
+    }
+    o_tbSetText(textbox, text);
+}
+
+// Runs every frame on the game's thread: copy changed text box text onto its page.
+static void MirrorTick() {
+    std::lock_guard<std::recursive_mutex> lk(g_ebLock);
+    for (auto& m : g_mirrors) {
+        if (!m.pagePtr) continue;
+        TrackedBox* t = FindBox(m.box);
+        if (!t || !t->box) continue;                  // nothing typed in this box yet: the page keeps its text
+        std::string live;
+        if (!ReadBoxUtf8(t->box, live)) { t->box = nullptr; continue; }
+        if (!m.dirty && live == m.shown) continue;
+        std::string disp = live.empty() ? m.original : Utf8ToGameText(live);   // original is game text already
+        g_inMirrorSet = true;
+        bool ok = RawPageSetText(m.pagePtr, disp.data(), disp.size());
+        g_inMirrorSet = false;
+        if (!ok) { Log("mirror: page \"%s\" could not be set; waiting for it again", m.page.c_str()); m.pagePtr = nullptr; continue; }
+        m.shown = std::move(live);
+        m.dirty = false;
+    }
+}
+
+static bool ScanTextBox() {
+    uint8_t* set = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 08 48 89 74 24 18 48 89 54 24 10 57 48 83 EC 20 48 8B F2 48 8B F9 48 81 C1 10 01 00 00 E8 ?? ?? ?? ?? 48 8D 97 10 01 00 00");
+    uint8_t* cpy = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 08 48 89 74 24 10 48 89 7C 24 18 41 56 48 83 EC 20 33 C0 0F 57 C0 0F 11 01 48 89 41 10 4C 8B F2 48 89 41 18 48 8B D9 48 83 7A 18 0F");
+    if (!set || !cpy) { Log("textbox scan: pattern missing (%p %p); bridge.editbox.mirror disabled", set, cpy); return false; }
+    g_tbSetText = (TbSetTextFn)set;
+    g_strCopy = (StrCopyFn)cpy;
+    Log("textbox scan: settext=hoi4+%#llx strcopy=hoi4+%#llx", (unsigned long long)(set - g_base),
+        (unsigned long long)(cpy - g_base));
+    return true;
 }
 
 // Replies are one line: backslash and line breaks are escaped (\\ \n).
@@ -563,6 +698,28 @@ static std::string EditBoxCommand(const std::string& sub, const std::string& arg
         if (!t) return "OK ";                                        // never typed into: empty
         if (t->box) { std::string live; if (ReadBoxUtf8(t->box, live)) t->text = std::move(live); else t->box = nullptr; }
         return "OK " + EscapeLine(t->text);
+    }
+    if (sub == "multiline") {
+        bool on = value != "0" && value != "off" && value != "no";
+        auto it = std::find(g_multilineNames.begin(), g_multilineNames.end(), name);
+        if (on && it == g_multilineNames.end()) g_multilineNames.push_back(name);
+        if (!on && it != g_multilineNames.end()) g_multilineNames.erase(it);
+        if (t && t->box && !RawBoxSetMultiline(t->box, on)) t->box = nullptr;
+        return std::string("OK ") + name + (on ? " is multi-line" : " is single-line") +
+               (t && t->box ? " (applied to the open box)" : " (applied when it is next typed into)");
+    }
+    if (sub == "mirror") {
+        if (!g_tbReady) return "ERROR text box mirroring not active (see console_bridge.log)";
+        auto it = std::find_if(g_mirrors.begin(), g_mirrors.end(), [&](const Mirror& m) { return m.box == name; });
+        if (value.empty() || value == "off") {
+            if (it != g_mirrors.end()) g_mirrors.erase(it);
+            return "OK mirror removed";
+        }
+        if (it != g_mirrors.end() && it->page == value) return "OK mirror already set";
+        if (it != g_mirrors.end()) g_mirrors.erase(it);
+        Mirror m; m.box = name; m.page = value;
+        g_mirrors.push_back(m);
+        return "OK " + name + " is shown in " + value + " (from the next time the page's text is set)";
     }
     if (sub == "set") {
         std::string text = UnescapeLine(value);
@@ -629,6 +786,8 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd.rfind("bridge.query ", 0) == 0) return Query(cmd.substr(13));
     if (cmd.rfind("bridge.loc ", 0) == 0) return LocLookup(cmd.substr(11));
     if (cmd == "bridge.editbox.list") return EditBoxCommand("list", "");
+    if (cmd.rfind("bridge.editbox.multiline ", 0) == 0) return EditBoxCommand("multiline", cmd.substr(25));
+    if (cmd.rfind("bridge.editbox.mirror ", 0) == 0) return EditBoxCommand("mirror", cmd.substr(22));
     if (cmd.rfind("bridge.editbox.set ", 0) == 0) return EditBoxCommand("set", cmd.substr(19));
     if (cmd.rfind("bridge.editbox ", 0) == 0) {
         std::string n = cmd.substr(15);
@@ -840,7 +999,10 @@ static HRESULT __stdcall hk_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
         Log("Present now on thread %lu (was %lu)", tid, g_frameThread);
         g_frameThread = tid;
     }
-    if (g_ready) RunQueued();
+    if (g_ready) {
+        if (g_tbReady) MirrorTick();
+        RunQueued();
+    }
     return o_present(sc, sync, flags);
 }
 
@@ -956,6 +1118,11 @@ static DWORD WINAPI InitThread(void*) {
                         MH_CreateHook((void*)g_ebDtor, &hk_ebDtor, (void**)&o_ebDtor) == MH_OK &&
                         MH_EnableHook((void*)g_ebInsert) == MH_OK && MH_EnableHook((void*)g_ebDtor) == MH_OK;
             Log(g_ebReady ? "editbox hooks on" : "editbox hooks FAILED");
+        }
+        if (g_ebReady && ScanTextBox()) {
+            g_tbReady = MH_CreateHook((void*)g_tbSetText, &hk_tbSetText, (void**)&o_tbSetText) == MH_OK &&
+                        MH_EnableHook((void*)g_tbSetText) == MH_OK;
+            Log(g_tbReady ? "textbox hook on" : "textbox hook FAILED");
         }
     } else {
         Log("patterns not found: this game version needs new patterns. Bridge disabled.");

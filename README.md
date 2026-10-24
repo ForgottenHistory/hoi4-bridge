@@ -45,6 +45,12 @@ It hooks the game's logger, so the lines also still reach game.log.
 | `bridge.editbox NAME` | text of the GUI text box with that .gui name (`\n` = line break, `\\` = backslash) |
 | `bridge.editbox.set NAME [text]` | replace that text box's text (no text = clear it) |
 | `bridge.editbox.list` | text boxes seen so far, open or closed |
+| `bridge.editbox.multiline NAME [off]` | Enter inserts a line break in that box (.gui can't set this) |
+| `bridge.editbox.mirror NAME PAGE` | show the box's whole text in the instant text box PAGE, live (`off` to stop) |
+
+A text box only ever draws the line with the cursor, so for multi-line input pair it with a page:
+the bridge hooks `CInstantTextBox::SetText` to find PAGE by name and sets the box's text on it each
+frame it changes (the page's own .gui text shows while the box is empty).
 
 Text boxes are found by hooking the game's text insert function, so a box is known once something has
 been typed, pasted or set into it. Its last text is kept after it closes.
