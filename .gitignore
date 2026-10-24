@@ -1,0 +1,8 @@
+build/
+__pycache__/
+*.pyc
+.venv*/
+# game binaries and dumps stay in the RE workbench
+re/bin/
+*.exe
+*.log

@@ -1,0 +1,4 @@
+﻿l_english:
+ # test file for bridge.reloadloc
+ news.24.t:0 "Loaded from a single file!"
+ news.24.d:0 "This description came from test_l_english.yml.\nSecond line."
