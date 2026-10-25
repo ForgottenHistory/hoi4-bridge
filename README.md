@@ -33,6 +33,7 @@ The DLL logs to `console_bridge.log` in the HOI4 folder.
 |---|---|
 | `bridge.player` | player's tag |
 | `bridge.country TAG` | live save-format block of one country |
+| `bridge.surrender TAG` | the game's own surrender numbers, as in the war overview tooltip: `progress=` (capitulation at 1), `occupation=` (share of victory points others control), `limit=` (occupation at which it capitulates) |
 | `bridge.setloc KEY text` | set one localisation key (`\n` = line break) |
 | `bridge.reloadloc <abs path>` | re-read one `.yml` file |
 | `bridge.locinfo` | localisation buffer usage |

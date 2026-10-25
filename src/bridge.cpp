@@ -385,6 +385,65 @@ static std::string DumpCountry(std::string tag) {
     return "OK \t" + tag + "={\n" + buf + "\t}";
 }
 
+// ---------------------------------------------------------------- surrender
+// The war overview's surrender tooltip ("controls X% of Victory Points and will capitulate when it has VAL% or
+// less", waroverviewitems.cpp) asks the country three things. Each writes an int64 fixed-point value into *out
+// (100000 = 100%) and returns out:
+//   progress(country, out)    surrender progress = occupation / limit; the country capitulates at 100%
+//   occupation(country, out)  share of its victory points that others control (the tooltip shows 100% - this)
+//   limit(country, out)       surrender limit: BASE_SURRENDER_LIMIT + surrender_limit modifier, x0.7 with no
+//                             owned cores, clamped to MIN_SURRENDER_LIMIT and 1 - max_surrender_limit_offset,
+//                             then + forced_surrender_limit, clamped to 0..1 (the tooltip shows 100% - this)
+using FixedFn = long long*(__fastcall*)(void* country, long long* out);
+static FixedFn g_surrProgress, g_surrOccupation, g_surrLimit;
+static bool    g_surrReady = false;
+
+static bool ScanSurrender() {
+    uint8_t* lim = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 48 8B FA 48 8B F1 48 8D 54 24 30 "
+        "48 81 C1 B8 05 00 00 41 B8 92 00 00 00 E8 ?? ?? ?? ?? 4C 8B 0D ?? ?? ?? ?? 48 8D 54 24 30");
+    uint8_t* occ = FindPattern(g_textStart, g_textEnd,
+        "40 53 48 83 EC 30 48 8B DA 48 C7 02 00 00 00 00 48 63 91 40 13 00 00 85 D2 7E ?? 48 63 81 38 13 00 00 "
+        "EB ?? 48 63 91 44 13 00 00 85 D2 7E ?? 48 63 81 3C 13 00 00 4C 69 C2 A0 86 01 00");
+    uint8_t* prog = FindPattern(g_textStart, g_textEnd,
+        "40 55 41 56 41 57 48 83 EC 40 83 B9 34 04 00 00 00 4C 8B FA 4C 8B F1 75 ?? BD A0 86 01 00 48 8B C2 "
+        "48 89 2A 48 83 C4 40 41 5F 41 5E 5D C3 48 89 5C 24 68 48 8D 54 24 60 48 89 74 24 70");
+    if (!lim || !occ || !prog) {
+        Log("surrender scan: pattern missing (%p %p %p); bridge.surrender disabled", lim, occ, prog);
+        return false;
+    }
+    g_surrLimit = (FixedFn)lim; g_surrOccupation = (FixedFn)occ; g_surrProgress = (FixedFn)prog;
+    Log("surrender scan: progress=hoi4+%#llx occupation=hoi4+%#llx limit=hoi4+%#llx",
+        (unsigned long long)(prog - g_base), (unsigned long long)(occ - g_base), (unsigned long long)(lim - g_base));
+    return true;
+}
+
+static bool RawSurrender(void* country, long long v[3], char* err, size_t cap) {
+    __try {
+        g_surrProgress(country, &v[0]);
+        g_surrOccupation(country, &v[1]);
+        g_surrLimit(country, &v[2]);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        snprintf(err, cap, "exception %#lx while the game computed surrender", GetExceptionCode());
+        return false;
+    }
+}
+
+static std::string Surrender(std::string tag) {
+    if (!g_dataReady || !g_surrReady) return "ERROR surrender support not active (see console_bridge.log)";
+    for (auto& ch : tag) ch = (char)toupper((unsigned char)ch);
+    char err[256] = "";
+    void* country = RawCountryByTag(tag.c_str(), err, sizeof err);
+    if (!country) return std::string("FAIL ") + err;
+    long long v[3] = {};
+    if (!RawSurrender(country, v, err, sizeof err)) return std::string("ERROR ") + err;
+    char out[160];
+    snprintf(out, sizeof out, "OK progress=%.5f occupation=%.5f limit=%.5f", v[0] / 100000.0, v[1] / 100000.0,
+             v[2] / 100000.0);
+    return out;
+}
+
 // ---------------------------------------------------------------- edit boxes
 // CEditBox (clausewitz editboxtype.cpp) holds its text buffer as a subobject at +0x80. The buffer stores the text
 // as a std::u32string at +0x30 (size +0x40, capacity +0x48; inline when capacity <= 3). Every change that adds
@@ -804,6 +863,11 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
         while (!tag.empty() && (tag.back() == ' ' || tag.back() == '\t')) tag.pop_back();
         return DumpCountry(tag);
     }
+    if (cmd.rfind("bridge.surrender ", 0) == 0) {
+        std::string tag = cmd.substr(17);
+        while (!tag.empty() && (tag.back() == ' ' || tag.back() == '\t')) tag.pop_back();
+        return Surrender(tag);
+    }
     auto rest = [&](size_t n) { std::string r = cmd.substr(n < cmd.size() ? n : cmd.size()); size_t s = r.find_first_not_of(" \t"); return s == std::string::npos ? std::string() : r.substr(s); };
     if (cmd == "bridge.locinfo") {
         if (!g_locReady) return "ERROR localisation support not active";
@@ -1111,6 +1175,7 @@ static DWORD WINAPI InitThread(void*) {
         else Log("console watch hook failed (not needed to run commands)");
         g_locReady = ScanLoc();
         g_dataReady = ScanData();
+        g_surrReady = ScanSurrender();
         g_logScanned = ScanLog();
         ScanLocalize();
         if (ScanEditBox()) {
