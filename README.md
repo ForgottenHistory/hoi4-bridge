@@ -26,6 +26,14 @@ The DLL logs to `console_bridge.log` in the HOI4 folder.
     send("tdebug")                 # -> ["OK ..."] / ["FAIL ..."] / ["ERROR ..."]
     setloc("my.key", "New text")   # localisation change, no reload
     country_block("GER")           # live save-format text of one country
+    query('GER = { log = "[THIS.GetLeader]" }')   # bridge.query, parsed -> ["Adolf Hitler"]
+    loc("GER_der_fuhrer")          # bridge.loc, parsed -> ["Der Führer"]
+    trigger("GER = { has_war_with = POL }")   # eval_trigger -> True / False
+    surrender("POL")               # bridge.surrender -> {"progress": .., "occupation": .., "limit": ..}
+    editbox("box"), editbox_set("box", "text")   # bridge.editbox / .set
+    decode_country(value)          # a country stored in a variable, as a save-format block shows it -> tag
+
+A failed command raises `BridgeError`; `BridgeUnavailable` if the game isn't reachable.
 
 ### Commands added by the bridge
 

@@ -7,6 +7,12 @@ From Python:
     from hoi4bridge import send, setloc, reload_loc_file, player_tag, country_block
     replies = send("tdebug")                  # -> ["OK ..."]  (or "FAIL ...", "ERROR ...")
     text = country_block("GER")               # live save-format text of one country
+    query('GER = { log = "[THIS.GetLeader]" }')   # -> ["Adolf Hitler"]   (bridge.query, parsed)
+    loc("GER_der_fuhrer")                     # -> ["Der Führer"]
+    trigger("GER = { has_war_with = POL }")   # -> True / False
+    surrender("POL")                          # -> {"progress": 0.62, "occupation": 0.5, "limit": 0.8}
+    editbox("my_box"), editbox_set("my_box", "text"), decode_country(value)
+A failed bridge command raises BridgeError (BridgeUnavailable if the game isn't reachable).
 
 No window focus or keyboard input is involved; the game does not even need to be in the foreground.
 """
@@ -124,6 +130,88 @@ def country_block(tag: str) -> str:
     if not r.startswith("OK "):
         raise RuntimeError(r.strip())
     return r[3:].rstrip("\n")
+
+
+# ---------------------------------------------------------------- reading the bridge's replies
+
+class BridgeError(RuntimeError):
+    """A bridge command ran but failed (the reply wasn't OK)."""
+
+
+SEP = "\x1e"   # separates the items of a bridge.query or bridge.loc reply
+
+
+def unescape(s: str) -> str:
+    """Bridge replies are one line: backslash-n is a line break, a doubled backslash is one backslash."""
+    out, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s):
+            out.append("\n" if s[i + 1] == "n" else s[i + 1])
+            i += 2
+        else:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
+def _ok(reply: str) -> str:
+    if not reply.startswith("OK"):
+        raise BridgeError(reply)
+    return reply[3:]
+
+
+def query(effect: str) -> list[str]:
+    """Run an effect (`TAG = { ... }`) and return the lines its `log = "..."` statements printed.
+    ROOT inside it is the country selected in the game's UI, so name countries explicitly."""
+    body = _ok(send(f"bridge.query {' '.join(effect.split())}")[0])
+    # Older bridge builds keep the log stream's trailing line break on each line.
+    return [unescape(x).rstrip("\r\n") for x in body.split(SEP)] if body else []
+
+
+def loc(*keys: str) -> list[str]:
+    """Localised text of each key, as the game shows it (a missing key comes back unchanged)."""
+    if not keys:
+        return []
+    vals = [unescape(x) for x in _ok(send("bridge.loc " + " ".join(keys))[0]).split(SEP)]
+    return vals + [""] * (len(keys) - len(vals))
+
+
+def trigger(script: str) -> bool:
+    """Evaluate a trigger (`TAG = { ... }`) with the console's eval_trigger: True if it holds."""
+    return send(f"eval_trigger {script}")[0].rstrip().endswith("yes")
+
+
+def surrender(tag: str) -> dict[str, float]:
+    """The game's own surrender numbers for a country (as in the war overview tooltip), each 0..1:
+    progress (it capitulates at 1), occupation (share of its victory points others control) and limit
+    (the occupation at which it capitulates)."""
+    out = {}
+    for kv in _ok(send(f"bridge.surrender {tag}")[0]).split():
+        k, _, v = kv.partition("=")
+        try:
+            out[k] = float(v)
+        except ValueError:
+            pass
+    return out
+
+
+def editbox(name: str) -> str:
+    """Text of the GUI text box with that .gui name."""
+    return unescape(_ok(send(f"bridge.editbox {name}")[0])).strip()
+
+
+def editbox_set(name: str, text: str = "") -> None:
+    """Replace that text box's text (no text clears it)."""
+    _ok(send(f"bridge.editbox.set {name} {text}".rstrip().replace("\r", "").replace("\n", "\\n"))[0])
+
+
+def decode_country(value: float):
+    """A country stored in a script variable shows in a save-format block as a packed number (0x40 marker +
+    the tag's 3 bytes, divided by 100000). Returns the tag, or None if the value isn't a country."""
+    raw = round(value * 100000) & 0xFFFFFFFF
+    if raw >> 24 != 0x40:
+        return None
+    return bytes([raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF]).decode("ascii", "replace")
 
 
 if __name__ == "__main__":
