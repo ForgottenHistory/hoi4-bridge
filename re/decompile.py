@@ -1,4 +1,4 @@
-# Usage: decompile.py <rva-hex> [<rva-hex> ...]  -> prints Ghidra's C decompilation (read-only, project not modified)
+# Usage: [HOI4_PROGRAM=hoi4_1.19.3.exe] decompile.py <rva-hex> [<rva-hex> ...]  -> prints Ghidra's C decompilation (read-only, project not modified)
 import os, sys, pyghidra
 # Ghidra and its project live in the RE workbench, outside this repo.
 WB = os.environ.get("HOI4_RE_WORKBENCH", r"C:\Users\Albin\hoi4-console-bridge")
@@ -7,7 +7,7 @@ from ghidra.base.project import GhidraProject
 from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import ConsoleTaskMonitor
 proj = GhidraProject.openProject(os.path.join(WB, "ghidra-project"), "hoi4", True)
-prog = proj.openProgram("/", "hoi4_1.19.3.exe", True)
+prog = proj.openProgram("/", os.environ.get("HOI4_PROGRAM", "hoi4_1.19.4.exe"), True)
 try:
     di = DecompInterface(); di.openProgram(prog)
     fm = prog.getFunctionManager(); base = prog.getImageBase()

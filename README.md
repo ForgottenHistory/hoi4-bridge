@@ -4,7 +4,7 @@ A `version.dll` proxy for Hearts of Iron IV that runs console commands sent over
 (`\\.\pipe\hoi4_console_bridge`). No keystrokes, no window focus. It also adds a few `bridge.*`
 commands the console doesn't have (change localisation live, read live country data).
 
-Singleplayer only. Targets the latest HOI4 version (1.19.3 as of 2026-10). It finds game functions
+Singleplayer only. Targets the latest HOI4 version (1.19.4 as of 2026-10). It finds game functions
 by byte patterns, so it can survive patches. If the log says "patterns not found", re-derive them.
 
 ## Build and install

@@ -489,12 +489,19 @@ static bool ScanEditBox() {
     uint8_t *ts = g_textStart, *te = g_textEnd;
     uint8_t* ins = FindPattern(ts, te, "48 89 74 24 18 57 48 83 EC 40 83 7A 10 01 48 8B F2 48 8B F9 75 ?? 48 8B 81 D8 00 00 00 48 85 C0 74 ?? 48 8B 52 18 48 8B CE 48 83 FA 03 76 ??");
     uint8_t* set = FindPattern(ts, te, "48 89 5C 24 10 57 48 83 EC 40 48 8B D9 0F 57 C0 0F 11 44 24 20 66 0F 6F 0D ?? ?? ?? ?? F3 0F 7F 4C 24 30 33 FF 89 7C 24 20 48 8D 4C 24 20");
-    uint8_t* dtor = FindPattern(ts, te, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 8B EA 48 8B D9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 81 80 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 81 A0 01 00 00");
+    // 1.19.4 split the deleting destructor from the plain one (no flags argument, vftable lea at +0x12);
+    // earlier versions hook the deleting destructor (flags in edx, lea at +0x19).
+    uint8_t* dtor = FindPattern(ts, te, "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 81 80 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 81 A0 01 00 00");
+    size_t vtOff = 0x12;
+    if (!dtor) {
+        dtor = FindPattern(ts, te, "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 8B EA 48 8B D9 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 05 ?? ?? ?? ?? 48 89 81 80 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 81 A0 01 00 00");
+        vtOff = 0x19;
+    }
     if (!ins || !set || !dtor) { Log("editbox scan: pattern missing (%p %p %p); editbox support disabled", ins, set, dtor); return false; }
     g_ebInsert  = (EbInsertFn)ins;
     g_ebSetText = (EbSetTextFn)set;
     g_ebDtor    = (EbDtorFn)dtor;
-    g_editBoxVt = Rel32(dtor + 0x19, 3, 7);                     // lea rax, [CEditBox::vftable]
+    g_editBoxVt = Rel32(dtor + vtOff, 3, 7);                    // lea rax, [CEditBox::vftable]
     Log("editbox scan: insert=hoi4+%#llx settext=hoi4+%#llx dtor=hoi4+%#llx vftable=hoi4+%#llx",
         (unsigned long long)(ins - g_base), (unsigned long long)(set - g_base), (unsigned long long)(dtor - g_base),
         (unsigned long long)((uint8_t*)g_editBoxVt - g_base));
