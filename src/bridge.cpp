@@ -848,7 +848,181 @@ static std::string LocLookup(const std::string& args) {
     return first ? "FAIL usage: bridge.loc KEY [KEY ...]" : out;
 }
 
+// ---------------------------------------------------------------- a relation of our own in the diplomacy view
+// The diplomacy view's relations list (left column: faction, guarantees, pacts ...) is an array of strip objects
+// the view creates once (CreateStrips, at view+0x1628), one per relation type and direction. On each update the view
+// gives every strip the shown country (strip+0x38, a tag id), asks it for every country whether the relation holds
+// (vtable slot 21) and adds the flag of each one that does; strips with flags go into the grid.
+// We append one more strip: a standard one with its own icon (GFX_relation_airp_treaty, which the mod defines) and a
+// copy of its vtable whose "holds" and tooltip methods use the country pairs set with bridge.treaties. A flag's
+// tooltip is the localisation key airp_rel_<A>_<B> (tags in alphabetical order), the icon's AIRP_TREATY_RELATION.
+using CreateStripsFn = void(__fastcall*)(uint8_t* view);
+using GameNewFn      = void*(__fastcall*)(size_t size);
+using StripCtorFn    = void*(__fastcall*)(void* mem, void* factory, int type, int dir);
+using PushPtrFn      = void(__fastcall*)(void* array, void** item);
+using SetSpriteFn    = void(__fastcall*)(void* icon, MsvcString* name, char flag);
+using StrAppendFn    = MsvcString*(__fastcall*)(MsvcString* s, const char* p, size_t n);
+static CreateStripsFn g_createStrips, o_createStrips;
+static GameNewFn      g_gameNew;
+static StripCtorFn    g_stripCtor;
+static PushPtrFn      g_pushPtr;
+static SetSpriteFn    g_setSprite;
+static StrAppendFn    g_strAppend;
+static uint8_t**      g_guiGlobal;        // *g_guiGlobal + 0x4f8: the GUI factory the strips are built from
+static void*          g_treatyVtbl[24];   // [0] RTTI locator, then the 23 slots
+static bool           g_relReady = false;
+static const int      kStripType = 0x27f8, kStripDir = 2;   // a type the game uses; only its sprite would show
+
+struct TagPair { char a[8]; char b[8]; };
+static SRWLOCK g_pairLock = SRWLOCK_INIT;
+static TagPair g_pairs[1024];
+static int     g_pairCount = 0;
+
+// Our strip's methods (vtable slots 19-21), defined below.
+static bool __fastcall TreatyFlagTip(uint8_t* strip, int* other, MsvcString* out);
+static bool __fastcall TreatyStripTip(uint8_t* strip, MsvcString* out);
+static bool __fastcall TreatyHolds(uint8_t* strip, int* other);
+
+static bool ScanRelations() {
+    uint8_t* cs = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 48 8B EC 48 83 EC 20 48 8B 05 ?? ?? ?? ?? "
+        "48 8B B0 F8 04 00 00 48 8D B9 28 16 00 00 B9 70 00 00 00 E8");
+    uint8_t* std_ = cs ? FindPattern(cs, cs + 0x1000, "41 B9 02 00 00 00 41 B8 F8 27 00 00 48 8B D6 48 8B C8 E8") : nullptr;
+    uint8_t* spr = FindPattern(g_textStart, g_textEnd, "45 33 C0 48 8D 55 ?? 49 8B 4E 20 E8");
+    uint8_t* app = FindPattern(g_textStart, g_textEnd,
+        "48 89 74 24 18 57 48 83 EC 30 48 8B F9 49 8B F0 48 8B 49 10 4C 8B 47 18 49 8B C0 48 2B C1 48 3B F0 77");
+    if (!cs || !std_ || !spr || !app || !g_localize || !g_dataReady) {
+        Log("relations scan: missing (%p %p %p %p, localize %p, data %d); diplomacy-view treaty row disabled",
+            cs, std_, spr, app, g_localize, (int)g_dataReady);
+        return false;
+    }
+    g_createStrips = (CreateStripsFn)cs;
+    g_guiGlobal    = (uint8_t**)Rel32(cs + 23, 3, 7);
+    g_gameNew      = (GameNewFn)Rel32(cs + 49, 1, 5);
+    g_pushPtr      = (PushPtrFn)Rel32(cs + 0x5c, 1, 5);
+    g_stripCtor    = (StripCtorFn)Rel32(std_ + 18, 1, 5);
+    g_setSprite    = (SetSpriteFn)Rel32(spr + 11, 1, 5);
+    g_strAppend    = (StrAppendFn)app;
+    // The standard strip's ctor sets its vtable: lea rax, [vtable]; mov [rbx], rax
+    uint8_t* ctor = (uint8_t*)g_stripCtor;
+    if (cs[0x5c] != 0xE8 || ctor[26] != 0x48 || ctor[27] != 0x8D || ctor[28] != 0x05) {
+        Log("relations scan: unexpected code around the strip ctor; treaty row disabled");
+        return false;
+    }
+    void** orig = (void**)Rel32(ctor + 26, 3, 7);
+    for (int i = 19; i <= 21; i++)
+        if (!InGameCode(orig[i])) { Log("relations scan: vtable slot %d not game code; treaty row disabled", i); return false; }
+    g_treatyVtbl[0] = orig[-1];
+    for (int i = 0; i < 23; i++) g_treatyVtbl[i + 1] = orig[i];
+    g_treatyVtbl[1 + 19] = (void*)&TreatyFlagTip;
+    g_treatyVtbl[1 + 20] = (void*)&TreatyStripTip;
+    g_treatyVtbl[1 + 21] = (void*)&TreatyHolds;
+    Log("relations scan: createStrips=hoi4+%#llx stripCtor=hoi4+%#llx vtable=hoi4+%#llx setSprite=hoi4+%#llx append=hoi4+%#llx",
+        (unsigned long long)(cs - g_base), (unsigned long long)(ctor - g_base),
+        (unsigned long long)((uint8_t*)orig - g_base), (unsigned long long)((uint8_t*)g_setSprite - g_base),
+        (unsigned long long)(app - g_base));
+    return true;
+}
+
+static bool TagOfId(int id, char out[8]) {
+    __try {
+        if (id < 1) return false;
+        MsvcString* s = g_tagName(&id);
+        if (!s || s->size == 0 || s->size > 7) return false;
+        memcpy(out, StrData(s), s->size); out[s->size] = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool HasPair(const char* a, const char* b) {
+    AcquireSRWLockShared(&g_pairLock);
+    bool found = false;
+    for (int i = 0; i < g_pairCount && !found; i++)
+        found = (!strcmp(g_pairs[i].a, a) && !strcmp(g_pairs[i].b, b)) || (!strcmp(g_pairs[i].a, b) && !strcmp(g_pairs[i].b, a));
+    ReleaseSRWLockShared(&g_pairLock);
+    return found;
+}
+
+static void AppendLocalized(MsvcString* out, const char* key) {
+    __try {
+        MsvcString s = {};
+        g_localize(&s, key, nullptr, 0);   // left to leak, as in RawLocalize
+        g_strAppend(out, StrData(&s), s.size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// vtable slot 21: does the relation hold between the shown country and `other`?
+static bool __fastcall TreatyHolds(uint8_t* strip, int* other) {
+    char a[8], b[8];
+    return TagOfId(*(int*)(strip + 0x38), a) && TagOfId(*other, b) && HasPair(a, b);
+}
+// slot 19: tooltip of one flag
+static bool __fastcall TreatyFlagTip(uint8_t* strip, int* other, MsvcString* out) {
+    char a[8], b[8], key[40];
+    if (!TagOfId(*(int*)(strip + 0x38), a) || !TagOfId(*other, b)) return false;
+    bool ab = strcmp(a, b) < 0;
+    snprintf(key, sizeof key, "airp_rel_%s_%s", ab ? a : b, ab ? b : a);
+    AppendLocalized(out, key);
+    return true;
+}
+// slot 20: tooltip of the icon
+static bool __fastcall TreatyStripTip(uint8_t* strip, MsvcString* out) {
+    AppendLocalized(out, "AIRP_TREATY_RELATION");
+    return true;
+}
+
+static void AddTreatyStrip(uint8_t* view) {
+    __try {
+        void* factory = *(void**)(*g_guiGlobal + 0x4f8);
+        void* mem = g_gameNew(0x70);
+        if (!mem) return;
+        uint8_t* strip = (uint8_t*)g_stripCtor(mem, factory, kStripType, kStripDir);
+        *(void***)strip = &g_treatyVtbl[1];
+        static char sprite[] = "GFX_relation_airp_treaty";
+        MsvcString name = {}; name.ptr = sprite; name.size = sizeof sprite - 1; name.cap = name.size;
+        g_setSprite(*(void**)(strip + 0x20), &name, 0);
+        void* item = strip;
+        g_pushPtr(view + 0x1628, &item);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("treaty row: exception %#lx adding the strip", GetExceptionCode());
+    }
+}
+
+static void __fastcall hk_createStrips(uint8_t* view) {
+    o_createStrips(view);
+    AddTreatyStrip(view);
+}
+
+// bridge.treaties [A:B ...]: the country pairs the treaty row shows (replaces the earlier set; none clears it).
+static std::string SetTreatyPairs(const std::string& args) {
+    if (!g_relReady) return "ERROR treaty row not active (see console_bridge.log)";
+    std::vector<TagPair> pairs;
+    size_t pos = 0;
+    while (pos < args.size()) {
+        size_t s = args.find_first_not_of(" \t", pos);
+        if (s == std::string::npos) break;
+        size_t e = args.find_first_of(" \t", s);
+        if (e == std::string::npos) e = args.size();
+        std::string tok = args.substr(s, e - s);
+        pos = e;
+        size_t c = tok.find(':');
+        if (c == std::string::npos || c == 0 || c > 7 || tok.size() - c - 1 == 0 || tok.size() - c - 1 > 7)
+            return "FAIL bad pair " + tok + " (usage: bridge.treaties A:B [C:D ...])";
+        TagPair p = {};
+        memcpy(p.a, tok.data(), c);
+        memcpy(p.b, tok.data() + c + 1, tok.size() - c - 1);
+        pairs.push_back(p);
+        if (pairs.size() > _countof(g_pairs)) return "FAIL too many pairs";
+    }
+    AcquireSRWLockExclusive(&g_pairLock);
+    for (size_t i = 0; i < pairs.size(); i++) g_pairs[i] = pairs[i];
+    g_pairCount = (int)pairs.size();
+    ReleaseSRWLockExclusive(&g_pairLock);
+    return "OK " + std::to_string(pairs.size()) + " pairs";
+}
+
 static std::string HandleBridgeCommand(const std::string& cmd) {
+    if (cmd == "bridge.treaties" || cmd.rfind("bridge.treaties ", 0) == 0) return SetTreatyPairs(cmd.substr(15));
     if (cmd.rfind("bridge.query ", 0) == 0) return Query(cmd.substr(13));
     if (cmd.rfind("bridge.loc ", 0) == 0) return LocLookup(cmd.substr(11));
     if (cmd == "bridge.editbox.list") return EditBoxCommand("list", "");
@@ -1185,6 +1359,11 @@ static DWORD WINAPI InitThread(void*) {
         g_surrReady = ScanSurrender();
         g_logScanned = ScanLog();
         ScanLocalize();
+        if (ScanRelations()) {
+            g_relReady = MH_CreateHook((void*)g_createStrips, &hk_createStrips, (void**)&o_createStrips) == MH_OK &&
+                         MH_EnableHook((void*)g_createStrips) == MH_OK;
+            Log(g_relReady ? "treaty row hook on" : "treaty row hook FAILED");
+        }
         if (ScanEditBox()) {
             g_ebReady = MH_CreateHook((void*)g_ebInsert, &hk_ebInsert, (void**)&o_ebInsert) == MH_OK &&
                         MH_CreateHook((void*)g_ebDtor, &hk_ebDtor, (void**)&o_ebDtor) == MH_OK &&

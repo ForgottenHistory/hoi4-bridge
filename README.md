@@ -47,6 +47,7 @@ A failed command raises `BridgeError`; `BridgeUnavailable` if the game isn't rea
 | `bridge.locinfo` | localisation buffer usage |
 | `bridge.query <effect>` | run an effect (`TAG = { ... }`) and return the lines its `log = "..."` statements print, separated by `\x1e` |
 | `bridge.loc KEY [KEY ...]` | localised text of each key, separated by `\x1e` (a missing key comes back unchanged) |
+| `bridge.treaties [A:B ...]` | the country pairs our own row in the diplomacy view's relations list shows a flag for (replaces the set; none clears it). The row's icon is `GFX_relation_airp_treaty`, its tooltip `AIRP_TREATY_RELATION`, a flag's tooltip `airp_rel_<A>_<B>` (tags in alphabetical order); the mod defines these |
 
 `bridge.query` makes script a query language: `log` formats with the game's own localisation, so
 `GER = { every_neighbor_country = { log = "[THIS.GetTag] [THIS.GetLeader]" } }` returns one line per neighbour.
