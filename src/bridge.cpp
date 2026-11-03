@@ -1542,6 +1542,11 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, void*) {
         GetModuleFileNameA(self, g_logPath, MAX_PATH);
         char* slash = strrchr(g_logPath, '\\');
         if (slash) strcpy_s(slash + 1, g_logPath + MAX_PATH - (slash + 1), "console_bridge.log");
+        // A fresh log each launch; the last one is kept as console_bridge.old.log
+        char old[MAX_PATH];
+        strcpy_s(old, g_logPath);
+        if (char* dot = strrchr(old, '.')) strcpy_s(dot, old + MAX_PATH - dot, ".old.log");
+        MoveFileExA(g_logPath, old, MOVEFILE_REPLACE_EXISTING);
         if (HANDLE h = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr)) CloseHandle(h);
     }
     return TRUE;

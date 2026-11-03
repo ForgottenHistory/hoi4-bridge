@@ -14,7 +14,8 @@ by byte patterns, so it can survive patches. If the log says "patterns not found
     install.bat          # copy build\version.dll into the HOI4 folder
     uninstall.bat        # remove it
 
-The DLL logs to `console_bridge.log` in the HOI4 folder.
+The DLL logs to `console_bridge.log` in the HOI4 folder, fresh each launch; the previous launch's log is kept as
+`console_bridge.old.log`.
 
 ## Client
 
