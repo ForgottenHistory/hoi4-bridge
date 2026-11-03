@@ -20,6 +20,8 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <map>
+#include <set>
 #include "MinHook.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -1021,7 +1023,144 @@ static std::string SetTreatyPairs(const std::string& args) {
     return "OK " + std::to_string(pairs.size()) + " pairs";
 }
 
+// ---------------------------------------------------------------- war declarations
+// Every diplomatic action is carried out by ExecuteAction(action), whoever starts it. An action a country sends (the
+// AI, the player's buttons) arrives as a CDiplomaticActionCommand and is run by ExecuteCommand(cmd, depth): depth 0
+// for the action sent, deeper for what follows from it in the same go (allies and guarantors declaring war in turn).
+// Script (declare_war_on in focuses and events), civil wars and countries joining a faction at war call
+// ExecuteAction directly, outside any command. A CDeclareWarAction holds the declarer's country id at +0x14 and the
+// target's at +0x1c.
+//
+// bridge.wars on: a declaration sent as a command (depth 0) by a country other than the player is dropped, unless
+// that pair was allowed (bridge.wars allow A:B ...). Script wars, follow-up declarations and the player's own are
+// untouched. Each dropped attempt is counted (bridge.wars attempts: who wanted war with whom, then cleared).
+using ExecCmdFn = void(__fastcall*)(void* cmd, int depth);
+using ExecActFn = void(__fastcall*)(uint8_t* action);
+static ExecCmdFn g_execCmd, o_execCmd;
+static ExecActFn g_execAct, o_execAct;
+static void*     g_declareWarVt;
+static bool      g_warReady = false;
+static volatile bool g_warsOn = false;
+static thread_local int t_cmdDepth = -1;              // depth of the command running on this thread, -1 if none
+static SRWLOCK g_warLock = SRWLOCK_INIT;
+static std::set<std::string> g_warAllowed;             // "A:B": A may declare war on B
+static std::map<std::string, int> g_warAttempts;       // "A:B" -> dropped declarations since last asked
+
+static bool ScanWar() {
+    uint8_t* cmd = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC 90 00 00 00 44 8B E2 45 33 FF "
+        "44 89 7D 6F 83 FA 0C 7C");
+    uint8_t* act = FindPattern(g_textStart, g_textEnd,
+        "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 88 FE FF FF 48 81 EC 78 02 00 00 0F 29 B4 24 60 02 00 00 "
+        "48 8B F1 45 33 E4 BA E8 20 00 00");
+    // CDeclareWarAction's constructor: base constructor, then this->vtable = &CDeclareWarAction::vftable
+    uint8_t* vt = FindPattern(g_textStart, g_textEnd, "4D 8D 4B D8 E8 ?? ?? ?? ?? 90 48 8D 05 ?? ?? ?? ?? 48 89 03 48 8D 4B 78");
+    if (!cmd || !act || !vt || !g_dataReady) {
+        Log("war scan: pattern missing (%p %p %p) or no country data; bridge.wars disabled", cmd, act, vt);
+        return false;
+    }
+    g_execCmd = (ExecCmdFn)cmd;
+    g_execAct = (ExecActFn)act;
+    g_declareWarVt = Rel32(vt + 10, 3, 7);
+    Log("war scan: executeCommand=hoi4+%#llx executeAction=hoi4+%#llx CDeclareWarAction vt=hoi4+%#llx",
+        (unsigned long long)(cmd - g_base), (unsigned long long)(act - g_base),
+        (unsigned long long)((uint8_t*)g_declareWarVt - g_base));
+    return true;
+}
+
+// The two countries of a declaration, as tags; false if the action isn't one or can't be read. SEH only.
+static bool RawWarPair(uint8_t* action, char a[16], char b[16]) {
+    __try {
+        if (*(void**)action != g_declareWarVt) return false;
+        int ida = *(int*)(action + 0x14), idb = *(int*)(action + 0x1c);
+        if (ida < 1 || idb < 1) return false;
+        MsvcString* sa = g_tagName(&ida);
+        MsvcString* sb = sa ? g_tagName(&idb) : nullptr;
+        if (!sa || !sb) return false;
+        strncpy_s(a, 16, StrData(sa), _TRUNCATE);
+        strncpy_s(b, 16, StrData(sb), _TRUNCATE);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void __fastcall hk_execCmd(void* cmd, int depth) {
+    int prev = t_cmdDepth;
+    t_cmdDepth = depth;
+    o_execCmd(cmd, depth);
+    t_cmdDepth = prev;
+}
+
+static void __fastcall hk_execAct(uint8_t* action) {
+    char a[16], b[16];
+    if (g_warsOn && t_cmdDepth == 0 && RawWarPair(action, a, b)) {
+        const char* player = RawPlayerTag();
+        if (!player || strcmp(player, a) != 0) {
+            std::string key = std::string(a) + ":" + b;
+            AcquireSRWLockExclusive(&g_warLock);
+            bool allowed = g_warAllowed.count(key) > 0;
+            if (!allowed) g_warAttempts[key]++;
+            ReleaseSRWLockExclusive(&g_warLock);
+            if (!allowed) {
+                Log("war: %s's declaration of war on %s dropped (not allowed)", a, b);
+                return;
+            }
+            Log("war: %s declares war on %s (allowed)", a, b);
+        }
+    }
+    o_execAct(action);
+}
+
+// bridge.wars [on | off | allow [A:B ...] | attempts]
+static std::string WarsCommand(const std::string& args) {
+    if (!g_warReady) return "ERROR war declarations not hooked (see console_bridge.log)";
+    std::vector<std::string> words;
+    size_t pos = 0;
+    while (pos < args.size()) {
+        size_t s = args.find_first_not_of(" \t", pos);
+        if (s == std::string::npos) break;
+        size_t e = args.find_first_of(" \t", s);
+        if (e == std::string::npos) e = args.size();
+        words.push_back(args.substr(s, e - s));
+        pos = e;
+    }
+    if (words.empty()) {
+        AcquireSRWLockShared(&g_warLock);
+        std::string out = std::string("OK ") + (g_warsOn ? "on" : "off") + ", " + std::to_string(g_warAllowed.size())
+                          + " pairs allowed, " + std::to_string(g_warAttempts.size()) + " pairs tried";
+        ReleaseSRWLockShared(&g_warLock);
+        return out;
+    }
+    if (words[0] == "on" || words[0] == "off") {
+        g_warsOn = words[0] == "on";
+        return std::string("OK ") + words[0];
+    }
+    if (words[0] == "allow") {
+        std::set<std::string> pairs;
+        for (size_t i = 1; i < words.size(); i++) {
+            std::string p = words[i];
+            for (auto& ch : p) ch = (char)toupper((unsigned char)ch);
+            size_t c = p.find(':');
+            if (c == std::string::npos || c == 0 || c + 1 >= p.size()) return "FAIL bad pair " + words[i];
+            pairs.insert(p);
+        }
+        AcquireSRWLockExclusive(&g_warLock);
+        g_warAllowed = pairs;
+        ReleaseSRWLockExclusive(&g_warLock);
+        return "OK " + std::to_string(pairs.size()) + " pairs allowed";
+    }
+    if (words[0] == "attempts") {
+        AcquireSRWLockExclusive(&g_warLock);
+        std::string out = "OK";
+        for (auto& kv : g_warAttempts) out += " " + kv.first + "=" + std::to_string(kv.second);
+        g_warAttempts.clear();
+        ReleaseSRWLockExclusive(&g_warLock);
+        return out;
+    }
+    return "FAIL usage: bridge.wars [on | off | allow [A:B ...] | attempts]";
+}
+
 static std::string HandleBridgeCommand(const std::string& cmd) {
+    if (cmd == "bridge.wars" || cmd.rfind("bridge.wars ", 0) == 0) return WarsCommand(cmd.substr(11));
     if (cmd == "bridge.treaties" || cmd.rfind("bridge.treaties ", 0) == 0) return SetTreatyPairs(cmd.substr(15));
     if (cmd.rfind("bridge.query ", 0) == 0) return Query(cmd.substr(13));
     if (cmd.rfind("bridge.loc ", 0) == 0) return LocLookup(cmd.substr(11));
@@ -1369,6 +1508,12 @@ static DWORD WINAPI InitThread(void*) {
                         MH_CreateHook((void*)g_ebDtor, &hk_ebDtor, (void**)&o_ebDtor) == MH_OK &&
                         MH_EnableHook((void*)g_ebInsert) == MH_OK && MH_EnableHook((void*)g_ebDtor) == MH_OK;
             Log(g_ebReady ? "editbox hooks on" : "editbox hooks FAILED");
+        }
+        if (ScanWar()) {
+            g_warReady = MH_CreateHook((void*)g_execCmd, &hk_execCmd, (void**)&o_execCmd) == MH_OK &&
+                         MH_CreateHook((void*)g_execAct, &hk_execAct, (void**)&o_execAct) == MH_OK &&
+                         MH_EnableHook((void*)g_execCmd) == MH_OK && MH_EnableHook((void*)g_execAct) == MH_OK;
+            Log(g_warReady ? "war declaration hooks on" : "war declaration hooks FAILED");
         }
         if (g_ebReady && ScanTextBox()) {
             g_tbReady = MH_CreateHook((void*)g_tbSetText, &hk_tbSetText, (void**)&o_tbSetText) == MH_OK &&
