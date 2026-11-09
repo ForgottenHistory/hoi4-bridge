@@ -2158,6 +2158,142 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
     }
 }
 
+// ---- bridge.plan: battle plans as the game's army UI makes them (recorded from a player drawing them).
+// A front line is a stretch of a CFront (handle type 66: the border between one of our areas and an enemy area in a
+// theatre; +0x20 its list of our border provinces in order, +0x58 the front sections drawn on it).
+//   COrderNewRootCommand (front line): +0x28 army handle, +0x30 division handles {data, cap, count} + allocator,
+//     +0x48 CFront handle, +0x50 2, +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
+//     percent (0..100000), +0x70 the CFront's section count + 1, +0x74 1, +0x80 an empty list.
+//   COrderNewFrontCommand (offensive line): +0x28 / +0x30 army handle, +0x38 division handles, +0x50 province ids
+//     of the line's points (the last one the target), +0x68 1, +0x70 1.
+//   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
+// Built by hand, checked, executed and not destroyed (their lists point at memory we never free).
+static void** VtableOf(const char* cls) {
+    for (auto& kv : g_cmdName) if (kv.second == cls) return (void**)kv.first;
+    return nullptr;
+}
+
+static int RunHandBuilt(uint8_t* cmd) {
+    void** vt = *(void***)cmd;
+    __try {
+        if (!((ValidFn)vt[9])(cmd, nullptr)) return 0;
+        t_bridgeIssued = true;
+        ((CmdExecFn)vt[10])(cmd, nullptr, nullptr, nullptr);
+        t_bridgeIssued = false;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return -1;
+    }
+}
+
+template <class T> static T* Persist(const std::vector<T>& v) {   // memory the game may keep pointing at
+    T* p = (T*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (v.size() + 1) * sizeof(T));
+    if (p && !v.empty()) memcpy(p, v.data(), v.size() * sizeof(T));
+    return p;
+}
+
+static void PutVec(uint8_t* cmd, int off, void* data, int n, void* alloc) {
+    *(void**)(cmd + off) = data;
+    *(int*)(cmd + off + 8) = n;
+    *(int*)(cmd + off + 12) = n;
+    *(void**)(cmd + off + 16) = alloc;
+}
+
+static uint8_t* NewHandBuilt(const char* cls) {
+    void** vt = VtableOf(cls);
+    if (!vt) return nullptr;
+    uint8_t* cmd = (uint8_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 0x200);
+    if (!cmd) return nullptr;
+    *(void***)cmd = vt;
+    *(int*)(cmd + 0x0c) = -1;
+    *(int*)(cmd + 0x18) = 0xffff;
+    return cmd;
+}
+
+static bool DivisionHandles(const std::vector<std::string>& ids, std::vector<uint64_t>& out, std::string& bad) {
+    char cls[96];
+    for (auto& s : ids) {
+        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(s.c_str()));
+        if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) { bad = s; return false; }
+        out.push_back(((uint64_t)(uint32_t)atoi(s.c_str()) << 32) | 51u);
+    }
+    return true;
+}
+
+static std::string RunReply(int r, const char* what) {
+    if (r == 1) return std::string("OK ") + what;
+    if (r == 0) return std::string("FAIL the game refused the ") + what;
+    return std::string("ERROR crashed on the ") + what;
+}
+
+// bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1]
+static std::string PlanCommand(const std::string& args) {
+    auto w = Words(args);
+    const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END DIVISION_ID.. | "
+                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1]";
+    if (w.size() < 2) return usage;
+    if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
+    int armyId = atoi(w[1].c_str());
+    if (!RawResolve(53, armyId)) return "FAIL no army with id " + w[1];
+    uint64_t army = ((uint64_t)(uint32_t)armyId << 32) | 53u;
+    std::string bad;
+    if (w[0] == "front" && w.size() >= 6) {
+        int frontId = atoi(w[2].c_str());
+        uint8_t* front = (uint8_t*)RawResolve(66, frontId);
+        char cls[96];
+        if (!front || !RawClassName(front, cls) || strcmp(cls, "CFront") != 0) return "FAIL no front with id " + w[2];
+        void* alloc = nullptr;
+        int sections = 0;
+        RawBytes(front + 0x30, (uint8_t*)&alloc, 8);
+        RawBytes(front + 0x64, (uint8_t*)&sections, 4);
+        std::vector<uint64_t> h;
+        if (!DivisionHandles(std::vector<std::string>(w.begin() + 5, w.end()), h, bad)) return "FAIL no division with id " + bad;
+        uint8_t* cmd = NewHandBuilt("COrderNewRootCommand");
+        if (!cmd) return "FAIL COrderNewRootCommand vtable not found";
+        *(uint64_t*)(cmd + 0x28) = army;
+        PutVec(cmd, 0x30, Persist(h), (int)h.size(), alloc);
+        *(uint64_t*)(cmd + 0x48) = ((uint64_t)(uint32_t)frontId << 32) | 66u;
+        *(int*)(cmd + 0x50) = 2;
+        *(int64_t*)(cmd + 0x58) = _atoi64(w[3].c_str());
+        *(int64_t*)(cmd + 0x60) = _atoi64(w[4].c_str());
+        *(int*)(cmd + 0x70) = sections + 1;
+        *(int*)(cmd + 0x74) = 1;
+        PutVec(cmd, 0x80, nullptr, 0, alloc);
+        return RunReply(RunHandBuilt(cmd), "front line");
+    }
+    if (w[0] == "arrow" && w.size() >= 4) {
+        std::vector<int> pts;
+        for (const char* c = w[2].c_str(); *c; ) {
+            pts.push_back(atoi(c));
+            while (*c && *c != ',') c++;
+            if (*c == ',') c++;
+        }
+        std::vector<uint64_t> h;
+        if (!DivisionHandles(std::vector<std::string>(w.begin() + 3, w.end()), h, bad)) return "FAIL no division with id " + bad;
+        uint8_t* front = (uint8_t*)RawResolve(66, 1);
+        void* alloc = nullptr;
+        if (front) RawBytes(front + 0x30, (uint8_t*)&alloc, 8);
+        uint8_t* cmd = NewHandBuilt("COrderNewFrontCommand");
+        if (!cmd) return "FAIL COrderNewFrontCommand vtable not found";
+        *(uint64_t*)(cmd + 0x28) = army;
+        *(uint64_t*)(cmd + 0x30) = army;
+        PutVec(cmd, 0x38, Persist(h), (int)h.size(), alloc);
+        PutVec(cmd, 0x50, Persist(pts), (int)pts.size(), alloc);
+        *(int*)(cmd + 0x68) = 1;
+        *(uint8_t*)(cmd + 0x70) = 1;
+        return RunReply(RunHandBuilt(cmd), "offensive line");
+    }
+    if (w[0] == "execute") {
+        uint8_t* cmd = NewHandBuilt("COrderExecuteCommand");
+        if (!cmd) return "FAIL COrderExecuteCommand vtable not found";
+        *(uint64_t*)(cmd + 0x28) = army;
+        *(int*)(cmd + 0x34) = w.size() > 2 ? atoi(w[2].c_str()) : 1;
+        return RunReply(RunHandBuilt(cmd), "execute");
+    }
+    return usage;
+}
+
 // The first pointer in OBJ[0, len) to an object of class CLS, or null.
 static uint8_t* PointerToClass(uint8_t* obj, size_t len, const char* clsWanted) {
     char cls[96];
@@ -2421,6 +2557,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
     if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
     if (cmd.rfind("bridge.army ", 0) == 0) return ArmyCommand(cmd.substr(12));
+    if (cmd == "bridge.plan" || cmd.rfind("bridge.plan ", 0) == 0) return PlanCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd == "bridge.stop" || cmd.rfind("bridge.stop ", 0) == 0) return StopCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd.rfind("bridge.watch ", 0) == 0) return WatchCommand(cmd.substr(13));
     if (cmd == "bridge.protect" || cmd.rfind("bridge.protect ", 0) == 0) return ProtectCommand(cmd.substr(14));
