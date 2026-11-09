@@ -2166,7 +2166,7 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
 //     +0x48 CFront handle, +0x50 2, +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
 //     percent (0..100000), +0x70 the CFront's section count + 1, +0x74 1, +0x80 an empty list.
 //   COrderNewFrontCommand (offensive line): +0x28 / +0x30 army handle, +0x38 division handles, +0x50 province ids
-//     of the line's points (the last one the target), +0x68 1, +0x70 1.
+//     of the line's points (the last one the target), +0x68 an id the game's check wants (found by trying), +0x70 1.
 //   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
 //   COrderDeleteCommand: +0x28 army handle (deletes the army's plan).
 // Built by hand, checked, executed and not destroyed (their lists point at memory we never free).
@@ -2282,9 +2282,18 @@ static std::string PlanCommand(const std::string& args) {
         *(uint64_t*)(cmd + 0x30) = army;
         PutVec(cmd, 0x38, Persist(h), (int)h.size(), alloc);
         PutVec(cmd, 0x50, Persist(pts), (int)pts.size(), alloc);
-        *(int*)(cmd + 0x68) = 1;
         *(uint8_t*)(cmd + 0x70) = 1;
-        return RunReply(RunHandBuilt(cmd), "offensive line");
+        // +0x68 is an id the game checks (1 for a player's first offensive line, 5 for a later one): try them in
+        // turn; a refused check changes nothing
+        int r = 0, id = 1;
+        for (; id <= 256 && r == 0; id++) {
+            *(int*)(cmd + 0x68) = id;
+            r = RunHandBuilt(cmd);
+        }
+        if (r != 1) return RunReply(r, "offensive line");
+        char b[64];
+        snprintf(b, sizeof b, "OK offensive line (id %d)", id - 1);
+        return b;
     }
     if (w[0] == "delete") {   // COrderDeleteCommand: +0x28 army handle; removes the army's plan, not the army
         uint8_t* cmd = NewHandBuilt("COrderDeleteCommand");
