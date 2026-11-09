@@ -7,6 +7,7 @@
 // in-game console uses), through the game's own console dispatcher.
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <intrin.h>
 #include "MinHook.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -1083,6 +1085,940 @@ static bool RawWarPair(uint8_t* action, char a[16], char b[16]) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ---------------------------------------------------------------- commands (research: logging and blocking)
+// Every player or AI action is a CCommand subclass; vtable slot 9 checks it, slot 10 (Execute(this)) carries it out.
+// All queued commands, the AI's and the player's, are executed by the command queue (hoi4+0x22c6d10 in 1.19.4).
+// The first bridge.cmdlog / bridge.cmdblock call finds every class whose RTTI name ends in "Command" and whose
+// vtable has CCommand's base slots, and points its slot 10 at hk_cmdExec.
+//
+// A command holds no sender. It names game objects by handle, {int type, int id} (type 0x35 = an order: front or
+// battle plan), which Resolve(&handle) turns into the object; the country follows from that object's owner.
+//
+// bridge.cmdlog on|off|dump: count executed commands by class. The first of each class from each caller, and the
+// next N of a class after `sample CLASS [N]`, go to the log: fields that read as country ids, and each handle the
+// command holds with its object's class and country-like fields.
+// bridge.cmdblock: drop commands of a class whose owner is a blocked country. A rule says where the owner is:
+// `rule CLASS - OFF` (an int country id at +OFF of the command) or `rule CLASS HOFF OFF` (the handle at +HOFF,
+// the country id at +OFF of its object).
+static const int kExecSlot = 10;
+using CmdExecFn = void(__fastcall*)(void* self, void* a, void* b, void* c);
+using ResolveFn = void*(__fastcall*)(const int* handle);
+static std::map<void*, CmdExecFn> g_cmdOrig;           // vtable -> original Execute; filled before any patch
+static std::map<void*, std::string> g_cmdName;         // vtable -> class name
+static bool g_cmdPatched = false;
+static ResolveFn g_resolve;
+static volatile bool g_cmdLogOn = false;
+static SRWLOCK g_cmdLogLock = SRWLOCK_INIT;
+static std::map<std::string, int> g_cmdCounts;         // class -> count since last dump
+static std::set<std::pair<std::string, uintptr_t>> g_cmdSeen;
+static std::map<std::string, int> g_cmdSample;         // class -> how many more to log
+
+struct BlockRule { int handleOff; int ownerOff; };     // handleOff -1: owner read from the command itself,
+                                                       // -2 (auto): the first handle with a known owner (as cmdrec)
+static SRWLOCK g_blockLock = SRWLOCK_INIT;
+static std::map<std::string, BlockRule> g_blockRules;  // class -> rule
+static std::set<std::string> g_blockTags;
+static std::map<std::string, int> g_blockDropped;      // "Class:TAG" -> dropped since last asked
+static volatile bool g_blockOn = false;                // any rule and any tag
+static thread_local bool t_bridgeIssued = false;       // the command running now was sent by the bridge (bridge.move)
+
+static bool RawBytes(const void* p, uint8_t* out, size_t n) {
+    __try { memcpy(out, p, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The tag of a country id, if it is one (three letters or digits); false otherwise. SEH only.
+static bool RawTagOf(int id, char out[8]) {
+    if (id < 1 || id > 2000 || !g_tagName) return false;
+    __try {
+        MsvcString* s = g_tagName(&id);
+        if (!s) return false;
+        const char* t = StrData(s);
+        for (int i = 0; i < 3; i++) if (!(isupper((unsigned char)t[i]) || isdigit((unsigned char)t[i]))) return false;
+        if (t[3] != 0) return false;
+        memcpy(out, t, 4);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The RTTI class name of an object with a vtable; false if it can't be read. SEH only.
+static bool RawClassName(void* obj, char out[96]) {
+    __try {
+        uint8_t* col = ((uint8_t**)*(void**)obj)[-1];
+        if (*(uint32_t*)col != 1) return false;
+        const char* n = (const char*)(g_base + *(uint32_t*)(col + 12) + 0x10);
+        if (n[0] != '.' || n[1] != '?' || n[2] != 'A') return false;
+        n += 4;
+        size_t i = 0;
+        while (i < 95 && n[i] && !(n[i] == '@' && n[i + 1] == '@')) { out[i] = n[i]; i++; }
+        out[i] = 0;
+        return i > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The object a {type, id} handle names, or null. Types 1..99 only (the table range). SEH only.
+static void* RawResolve(int type, int id) {
+    if (!g_resolve || type < 1 || type > 99 || id < 1) return nullptr;
+    int h[2] = { type, id };
+    __try { return g_resolve(h); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// " +0x28=ITA +0x30=GER" for the 4-byte fields of p[from, to) that read as country ids.
+static std::string TagFields(const uint8_t* p, size_t from, size_t to) {
+    std::string out;
+    for (size_t o = from; o + 4 <= to; o += 4) {
+        char t[8], b[24];
+        if (RawTagOf(*(const int*)(p + o), t)) { snprintf(b, sizeof b, " +%#zx=%s", o, t); out += b; }
+    }
+    return out;
+}
+
+// One object, for the log or a reply: "CClass tags: ..." over its first 0x400 bytes.
+static std::string DescribeObject(void* obj) {
+    char cls[96];
+    if (!RawClassName(obj, cls)) strcpy_s(cls, "?");
+    std::vector<uint8_t> buf(0x400);
+    std::string tags = RawBytes(obj, buf.data(), buf.size()) ? TagFields(buf.data(), 8, buf.size()) : " (unreadable)";
+    return std::string(cls) + " tags:" + tags;
+}
+
+static void LogCommandSample(const std::string& name, uintptr_t caller, void* self) {
+    uint8_t bytes[0x88];
+    char hex[0x88 * 3 + 1] = "";
+    if (!RawBytes(self, bytes, sizeof bytes)) { Log("cmdlog: %s unreadable", name.c_str()); return; }
+    for (size_t i = 0; i < sizeof bytes; i++) snprintf(hex + i * 3, 4, "%02X ", bytes[i]);
+    Log("cmdlog: %s from hoi4+%#llx tid %lu tags:%s | %s", name.c_str(), (unsigned long long)caller,
+        GetCurrentThreadId(), TagFields(bytes, 0x24, sizeof bytes).c_str(), hex);
+    for (size_t o = 0x24; o + 8 <= sizeof bytes; o += 4) {
+        int type = *(int*)(bytes + o), id = *(int*)(bytes + o + 4);
+        if (type < 1 || type > 99 || id < 1) continue;
+        if (void* obj = RawResolve(type, id))
+            Log("cmdlog:   handle +%#zx {%d,%d} -> %s", o, type, id, DescribeObject(obj).c_str());
+    }
+}
+
+// The owner tag of a command under a rule; false if it can't be read. SEH only.
+static bool RawOwner(void* self, const BlockRule& r, char tag[8]) {
+    __try {
+        uint8_t* base = (uint8_t*)self;
+        if (r.handleOff >= 0) {
+            const int* h = (const int*)(base + r.handleOff);
+            base = (uint8_t*)RawResolve(h[0], h[1]);
+            if (!base) return false;
+        }
+        return RawTagOf(*(int*)(base + r.ownerOff), tag);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ---- bridge.cmdrec: every executed command, one line each, to a file (research: how a player and the AI play)
+// Line: seq, ms since recording began, class, owner tag (or -), how the owner was found, header +0xc (1 queued,
+// -1 direct), the handles that resolve ("+0x28=53:447"), the first kRecBytes bytes as hex.
+// `mark TEXT` writes "#mark ms TEXT" (the recorder script stamps the game date this way).
+// Owner: a cmdblock rule for the class if there is one, else the first handle whose type has a known owner offset.
+static const size_t kRecBytes = 0xa0;
+static SRWLOCK g_recLock = SRWLOCK_INIT;
+static FILE* g_recFile = nullptr;
+static volatile bool g_recOn = false;
+static std::string g_recPath;
+static std::set<std::string> g_recSkip;                // classes not recorded
+// handle type -> where its object keeps the owner's country id: a chain of offsets, every one but the last followed
+// as a pointer; a type may have several, tried in order. A theatre (67) has no owner field: its armies' list is at
+// +0x80 (the first army's owner at +0x3c); while it has no army, its divisions' list at +0x68 (full objects, owner
+// at +0x1d8).
+static int g_recOwnerType[16] = { 51, 53, 67, 67 }, g_recOwnerN = 4;
+static int g_recOwnerOff[16][4] = { { 0x1c8 }, { 0x3c }, { 0x80, 0, 0x3c }, { 0x68, 0, 0x1d8 } };
+static int g_recOwnerLen[16] = { 1, 1, 3, 3 };
+static unsigned long long g_recSeq = 0, g_recStart = 0;
+
+// Per-class rules for data behind pointers (a last column, "-" if none):
+//   list:  a vector, data pointer at +off, int count at +b, elements of c bytes -> "L+0x28=[51:3,51:9]"
+//          (each element as its 4-byte ints joined by ':'; at most 64 elements)
+//   deref: an object pointer at +off, the int at +b of it -> "D+0x40=CProvince.0xa4=6325"
+// The column also names the class of every pointer in the command that leads to an object with RTTI ("P+0x40=CX").
+struct RecRule { char kind; int off, b, c; };
+static std::map<std::string, std::vector<RecRule>> g_recRules = {
+    // CMoveCommand embeds a CUnitMoveAction at +0x28: army handle at +0x38, province ids (the path; the last one is
+    // the destination) at +0x40 with count +0x4c, a second province list at +0x58 / +0x64
+    { "CMoveCommand",          { { 'L', 0x40, 0x4c, 4 }, { 'L', 0x58, 0x64, 4 } } },
+    { "COrderAssignCommand",   { { 'L', 0x28, 0x30, 8 } } },
+    { "COrderUnassignCommand", { { 'L', 0x28, 0x30, 8 } } },
+    { "COrderNewFrontCommand", { { 'L', 0x38, 0x40, 8 }, { 'L', 0x50, 0x5c, 4 } } },   // divisions; provinces?
+};
+
+static std::string RecExtra(const uint8_t* bytes, const std::vector<RecRule>* rules) {
+    std::string out;
+    char b[160], cls[96];
+    for (size_t o = 0x20; o + 8 <= kRecBytes; o += 8) {
+        uintptr_t p = *(const uintptr_t*)(bytes + o);
+        if (p < 0x10000 || p > 0x7fffffffffffull || (p & 7)) continue;
+        if (RawClassName((void*)p, cls)) { snprintf(b, sizeof b, " P+%#zx=%s", o, cls); out += b; }
+    }
+    if (rules) for (auto& r : *rules) {
+        uint8_t* p = *(uint8_t* const*)(bytes + r.off);
+        if (r.kind == 'D') {
+            int v;
+            if (!RawClassName(p, cls)) strcpy_s(cls, "?");
+            if (RawBytes(p + r.b, (uint8_t*)&v, 4)) { snprintf(b, sizeof b, " D+%#x=%s.%#x=%d", r.off, cls, r.b, v); out += b; }
+        } else if (r.kind == 'L') {
+            int n = *(const int*)(bytes + r.b);
+            if (n < 0 || n > 64 || r.c < 4 || r.c > 64) continue;
+            std::vector<uint8_t> v((size_t)n * r.c);
+            if (n && !RawBytes(p, v.data(), v.size())) continue;
+            snprintf(b, sizeof b, " L+%#x=[", r.off);
+            out += b;
+            for (int i = 0; i < n; i++) {
+                for (int k = 0; k < r.c / 4; k++) {
+                    snprintf(b, sizeof b, "%s%d", k ? ":" : (i ? "," : ""), *(int*)(v.data() + (size_t)i * r.c + k * 4));
+                    out += b;
+                }
+            }
+            out += "]";
+        }
+    }
+    return out.empty() ? "-" : out.substr(1);
+}
+
+// Owner from the first handle in the command whose type has a known owner offset. No SEH needed here.
+static bool RecOwnerFromHandles(const uint8_t* bytes, char tag[8], int* via) {
+    for (size_t o = 0x24; o + 8 <= kRecBytes; o += 4) {
+        int type = *(const int*)(bytes + o), id = *(const int*)(bytes + o + 4);
+        if (id < 1) continue;
+        uint8_t* obj = nullptr;
+        for (int k = 0; k < g_recOwnerN; k++) {
+            if (g_recOwnerType[k] != type) continue;
+            if (!obj && !(obj = (uint8_t*)RawResolve(type, id))) break;
+            uint8_t* p = obj;
+            for (int j = 0; p && j + 1 < g_recOwnerLen[k]; j++)
+                if (!RawBytes(p + g_recOwnerOff[k][j], (uint8_t*)&p, 8)) p = nullptr;
+            int c;
+            if (p && RawBytes(p + g_recOwnerOff[k][g_recOwnerLen[k] - 1], (uint8_t*)&c, 4) && RawTagOf(c, tag)) {
+                *via = (int)o;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// The owner of a command under a rule, including auto rules.
+static bool BlockOwner(void* self, const BlockRule& r, char tag[8]) {
+    if (r.handleOff != -2) return RawOwner(self, r, tag);
+    uint8_t b[kRecBytes];
+    int via;
+    return RawBytes(self, b, sizeof b) && RecOwnerFromHandles(b, tag, &via);
+}
+
+static void RecordCommand(const std::string& name, void* self) {
+    uint8_t bytes[kRecBytes];
+    if (!RawBytes(self, bytes, sizeof bytes)) memset(bytes, 0, sizeof bytes);
+    AcquireSRWLockShared(&g_recLock);
+    bool skip = g_recSkip.count(name) > 0;
+    auto rr = g_recRules.find(name);
+    std::string extra = skip ? "" : RecExtra(bytes, rr == g_recRules.end() ? nullptr : &rr->second);
+    if (t_bridgeIssued) extra = (extra == "-" ? "" : extra + " ") + "SRC=bridge";
+    ReleaseSRWLockShared(&g_recLock);
+    if (skip) return;
+    char tag[8] = "-", via[16] = "-";
+    bool found = false;
+    {
+        AcquireSRWLockShared(&g_blockLock);
+        auto r = g_blockRules.find(name);
+        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag)) { found = true; strcpy_s(via, "rule"); }
+        ReleaseSRWLockShared(&g_blockLock);
+    }
+    int vo;
+    if (!found && RecOwnerFromHandles(bytes, tag, &vo)) { found = true; snprintf(via, sizeof via, "+%#x", vo); }
+    if (!found) strcpy_s(tag, "-");
+    std::string handles;
+    for (size_t o = 0x24; o + 8 <= kRecBytes; o += 4) {
+        int type = *(int*)(bytes + o), id = *(int*)(bytes + o + 4);
+        if (type < 1 || type > 99 || id < 1 || !RawResolve(type, id)) continue;
+        char b[40];
+        snprintf(b, sizeof b, "%s+%#zx=%d:%d", handles.empty() ? "" : ",", o, type, id);
+        handles += b;
+    }
+    char hex[kRecBytes * 2 + 1];
+    for (size_t i = 0; i < kRecBytes; i++) snprintf(hex + i * 2, 3, "%02X", bytes[i]);
+    AcquireSRWLockExclusive(&g_recLock);
+    if (g_recFile)
+        fprintf(g_recFile, "%llu\t%llu\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", ++g_recSeq, GetTickCount64() - g_recStart,
+            name.c_str(), tag, via, *(int*)(bytes + 0xc), handles.empty() ? "-" : handles.c_str(), hex, extra.c_str());
+    ReleaseSRWLockExclusive(&g_recLock);
+}
+
+static void __fastcall hk_cmdExec(void* self, void* a, void* b, void* c) {
+    void* vt = *(void**)self;
+    auto it = g_cmdOrig.find(vt);
+    if (it == g_cmdOrig.end()) return;   // can't happen: only patched vtables lead here
+    const std::string& name = g_cmdName.find(vt)->second;
+    if (g_recOn) RecordCommand(name, self);   // before Execute: the command and its objects are as sent
+    if (g_cmdLogOn) {
+        uintptr_t caller = (uintptr_t)((uint8_t*)_ReturnAddress() - g_base);
+        AcquireSRWLockExclusive(&g_cmdLogLock);
+        g_cmdCounts[name]++;
+        bool sample = g_cmdSeen.insert({ name, caller }).second;
+        auto s = g_cmdSample.find(name);
+        if (s != g_cmdSample.end()) { sample = true; if (--s->second <= 0) g_cmdSample.erase(s); }
+        ReleaseSRWLockExclusive(&g_cmdLogLock);
+        if (sample) LogCommandSample(name, caller, self);
+    }
+    if (g_blockOn && !t_bridgeIssued) {
+        bool drop = false;
+        char tag[8];
+        AcquireSRWLockExclusive(&g_blockLock);
+        auto r = g_blockRules.find(name);
+        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag) && g_blockTags.count(tag)) {
+            drop = true;
+            g_blockDropped[name + ":" + tag]++;
+        }
+        ReleaseSRWLockExclusive(&g_blockLock);
+        if (drop) return;
+    }
+    it->second(self, a, b, c);
+}
+
+// Finds the command vtables from RTTI and patches their Execute slot. Once, on the game's main thread.
+static int PatchCommandVtables() {
+    auto dos = (IMAGE_DOS_HEADER*)g_base;
+    auto nt = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    uint8_t *rs = nullptr, *re = nullptr;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++)
+        if (!memcmp(sec->Name, ".rdata", 6)) { rs = g_base + sec->VirtualAddress; re = rs + sec->Misc.VirtualSize; }
+    if (!rs) { Log("cmdlog: no .rdata section"); return -1; }
+
+    // Resolve(&handle): {type, id} -> object
+    g_resolve = (ResolveFn)FindPattern(g_textStart, g_textEnd,
+        "48 83 EC 28 8B 01 3D ?? ?? 00 00 76 ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 74 ?? 48 8B D1 48 8B C8 E8");
+    Log("cmdlog: handle resolver %s", g_resolve ? "found" : "NOT found (no handle info, no handle rules)");
+
+    // Complete object locators: signature 1, offset 0, self rva at +20; the type descriptor's name at td+0x10.
+    std::map<uint8_t*, std::string> cols;   // COL -> class name, for "...Command" classes
+    uint8_t* baseCol = nullptr;
+    for (uint8_t* p = rs; p + 24 <= re; p += 4) {
+        if (*(uint32_t*)p != 1 || *(uint32_t*)(p + 4) != 0 || *(uint32_t*)(p + 20) != (uint32_t)(p - g_base)) continue;
+        uint32_t td = *(uint32_t*)(p + 12);
+        if (td == 0 || td >= nt->OptionalHeader.SizeOfImage - 0x20) continue;
+        const char* n = (const char*)(g_base + td + 0x10);
+        if (strncmp(n, ".?AV", 4) != 0) continue;
+        std::string name(n + 4);
+        size_t at = name.find("@@");
+        if (at == std::string::npos) continue;
+        name.resize(at);
+        if (name == "CCommand") baseCol = p;
+        else if (name.size() > 7 && name.compare(name.size() - 7, 7, "Command") == 0) cols[p] = name;
+    }
+    if (!baseCol) { Log("cmdlog: CCommand RTTI not found"); return -1; }
+
+    // A vtable sits right after a pointer to its COL.
+    void** baseVt = nullptr;
+    std::vector<std::pair<void**, std::string>> vts;
+    for (uint8_t* p = rs; p + 16 <= re; p += 8) {
+        uint8_t* col = *(uint8_t**)p;
+        if (col < rs || col >= re) continue;
+        if (col == baseCol) baseVt = (void**)(p + 8);
+        else { auto it = cols.find(col); if (it != cols.end()) vts.push_back({ (void**)(p + 8), it->second }); }
+    }
+    if (!baseVt) { Log("cmdlog: CCommand vtable not found"); return -1; }
+
+    for (auto& v : vts) {
+        bool derived = true;
+        for (int s = 1; s <= 4; s++) if (v.first[s] != baseVt[s]) derived = false;
+        if (!derived || v.first[kExecSlot] == baseVt[kExecSlot]) continue;  // not a CCommand, or abstract
+        g_cmdOrig[v.first] = (CmdExecFn)v.first[kExecSlot];
+        g_cmdName[v.first] = v.second;
+    }
+    int n = 0;
+    for (auto& kv : g_cmdOrig) {
+        void** slot = (void**)kv.first + kExecSlot;
+        DWORD old;
+        if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) continue;
+        InterlockedExchangePointer(slot, (void*)&hk_cmdExec);
+        VirtualProtect(slot, sizeof(void*), old, &old);
+        n++;
+    }
+    Log("cmdlog: patched Execute of %d command classes (%zu candidates)", n, vts.size());
+    return n;
+}
+
+static bool EnsureCommandsPatched() {
+    if (!g_cmdPatched) g_cmdPatched = PatchCommandVtables() > 0;
+    return g_cmdPatched;
+}
+
+static std::vector<std::string> Words(const std::string& s) {
+    std::vector<std::string> w;
+    size_t i = 0;
+    while (i < s.size()) {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+        size_t j = i;
+        while (j < s.size() && s[j] != ' ' && s[j] != '\t') j++;
+        if (j > i) w.push_back(s.substr(i, j - i));
+        i = j;
+    }
+    return w;
+}
+
+static std::string CmdLogCommand(const std::string& args) {
+    auto w = Words(args);
+    std::string a = w.empty() ? "" : w[0];
+    if (a == "on") {
+        if (!EnsureCommandsPatched()) return "FAIL could not find the command vtables (see console_bridge.log)";
+        g_cmdLogOn = true;
+        return "OK command log on (" + std::to_string(g_cmdOrig.size()) + " command classes)";
+    }
+    if (a == "off") { g_cmdLogOn = false; return "OK command log off"; }
+    if (a == "sample" && w.size() >= 2) {
+        int n = w.size() > 2 ? atoi(w[2].c_str()) : 5;
+        if (n < 1) return "FAIL usage: bridge.cmdlog sample CLASS [N]";
+        AcquireSRWLockExclusive(&g_cmdLogLock);
+        g_cmdSample[w[1]] = n;
+        ReleaseSRWLockExclusive(&g_cmdLogLock);
+        return "OK logging the next " + std::to_string(n) + " " + w[1];
+    }
+    if (a == "dump") {
+        AcquireSRWLockExclusive(&g_cmdLogLock);
+        std::vector<std::pair<int, std::string>> v;
+        for (auto& kv : g_cmdCounts) v.push_back({ kv.second, kv.first });
+        g_cmdCounts.clear();
+        ReleaseSRWLockExclusive(&g_cmdLogLock);
+        std::sort(v.rbegin(), v.rend());
+        std::string out = "OK";
+        for (auto& e : v) out += " " + e.second + "=" + std::to_string(e.first);
+        return out;
+    }
+    if (a.empty()) return std::string("OK command log ") + (g_cmdLogOn ? "on" : "off");
+    return "FAIL usage: bridge.cmdlog [on | off | dump | sample CLASS [N]]";
+}
+
+static std::string CmdBlockCommand(const std::string& args) {
+    auto w = Words(args);
+    if (!EnsureCommandsPatched()) return "FAIL could not find the command vtables (see console_bridge.log)";
+    std::string out = "OK";
+    AcquireSRWLockExclusive(&g_blockLock);
+    if (w.size() == 3 && w[0] == "rule" && w[2] == "off") {
+        g_blockRules.erase(w[1]);
+        out += " rule for " + w[1] + " removed";
+    } else if (w.size() == 3 && w[0] == "rule" && w[2] == "auto") {
+        if (!g_resolve) out = "FAIL no handle resolver";
+        else { g_blockRules[w[1]] = BlockRule{ -2, 0 }; out += " auto rule for " + w[1]; }
+    } else if (w.size() == 4 && w[0] == "rule") {
+        BlockRule r;
+        r.handleOff = w[2] == "-" ? -1 : (int)strtol(w[2].c_str(), nullptr, 0);
+        r.ownerOff = (int)strtol(w[3].c_str(), nullptr, 0);
+        if (r.handleOff >= 0 && !g_resolve) out = "FAIL no handle resolver; only `rule CLASS - OFF` works";
+        else { g_blockRules[w[1]] = r; out += " rule for " + w[1]; }
+    } else if (w.size() >= 2 && (w[0] == "add" || w[0] == "remove")) {
+        for (size_t i = 1; i < w.size(); i++) {
+            std::string t = w[i];
+            for (auto& ch : t) ch = (char)toupper((unsigned char)ch);
+            if (w[0] == "add") g_blockTags.insert(t); else g_blockTags.erase(t);
+        }
+    } else if (w.size() == 1 && w[0] == "clear") {
+        g_blockTags.clear();
+    } else if (w.size() == 1 && w[0] == "dropped") {
+        for (auto& kv : g_blockDropped) out += " " + kv.first + "=" + std::to_string(kv.second);
+        g_blockDropped.clear();
+    } else if (!w.empty()) {
+        out = "FAIL usage: bridge.cmdblock [rule CLASS -|HOFF OFF | rule CLASS auto | rule CLASS off | add TAG.. | remove TAG.. | clear | dropped]";
+    }
+    if (w.empty()) {
+        out += " tags:";
+        for (auto& t : g_blockTags) out += " " + t;
+        out += " rules:";
+        for (auto& kv : g_blockRules) {
+            char b[64];
+            if (kv.second.handleOff == -2) snprintf(b, sizeof b, "(auto)");
+            else if (kv.second.handleOff < 0) snprintf(b, sizeof b, "(-,%#x)", kv.second.ownerOff);
+            else snprintf(b, sizeof b, "(%#x,%#x)", kv.second.handleOff, kv.second.ownerOff);
+            out += " " + kv.first + b;
+        }
+    }
+    g_blockOn = !g_blockRules.empty() && !g_blockTags.empty();
+    ReleaseSRWLockExclusive(&g_blockLock);
+    return out;
+}
+
+// " P+0x1e0=CProvince ..." for the 8-aligned fields of p[from, to) that point to an object with RTTI.
+static std::string PtrFields(const uint8_t* p, size_t from, size_t to) {
+    std::string out;
+    char cls[96], b[140];
+    for (size_t o = from; o + 8 <= to; o += 8) {
+        uintptr_t v = *(const uintptr_t*)(p + o);
+        if (v < 0x10000 || v > 0x7fffffffffffull || (v & 7)) continue;
+        if (RawClassName((void*)v, cls)) { snprintf(b, sizeof b, " P+%#zx=%s", o, cls); out += b; }
+    }
+    return out;
+}
+
+// bridge.object TYPE ID: the object a handle names: "CClass @addr tags: +0x..=TAG ... ptrs: P+0x..=CClass ..."
+static std::string ObjectCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() != 2) return "FAIL usage: bridge.object TYPE ID";
+    EnsureCommandsPatched();
+    if (!g_resolve) return "FAIL no handle resolver";
+    void* obj = RawResolve((int)strtol(w[0].c_str(), nullptr, 0), (int)strtol(w[1].c_str(), nullptr, 0));
+    if (!obj) return "FAIL no such object";
+    std::vector<uint8_t> buf(0x800);
+    char at[40];
+    snprintf(at, sizeof at, " @%#llx", (unsigned long long)(uintptr_t)obj);
+    std::string ptrs = RawBytes(obj, buf.data(), buf.size()) ? PtrFields(buf.data(), 8, buf.size()) : "";
+    return "OK " + DescribeObject(obj) + at + " ptrs:" + ptrs;
+}
+
+// bridge.mem ADDR LEN: LEN (<= 0x1000) bytes at ADDR (hex) as hex; "?" for an unreadable 16-byte line.
+static std::string MemCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() != 2) return "FAIL usage: bridge.mem ADDR LEN";
+    uintptr_t a = (uintptr_t)strtoull(w[0].c_str(), nullptr, 16);
+    size_t n = (size_t)strtoul(w[1].c_str(), nullptr, 0);
+    if (n == 0 || n > 0x1000) return "FAIL LEN must be 1..0x1000";
+    std::string out = "OK ";
+    uint8_t line[16];
+    char h[3];
+    for (size_t o = 0; o < n; o += 16) {
+        size_t k = std::min<size_t>(16, n - o);
+        if (!RawBytes((void*)(a + o), line, k)) { out += std::string(k * 2, '?'); continue; }
+        for (size_t i = 0; i < k; i++) { snprintf(h, sizeof h, "%02X", line[i]); out += h; }
+    }
+    return out;
+}
+
+// ---- bridge.snap: chosen fields of every object of one handle type, appended to a file (research: daily snapshots)
+// bridge.snap LABEL TYPE [class=CName] FIELD...   -> "#snap LABEL TYPE FIELD..." then "id<TAB>v1<TAB>v2..." lines
+// bridge.snap reset [PATH] (default unit_snapshots.tsv in the HOI4 folder; truncates it)
+// A FIELD is a kind letter and a chain of hex offsets: every offset but the last is followed as a pointer.
+//   i int, f float, b byte, c country id -> tag, s MSVC std::string, x 64-bit value (hex)
+//   e.g. c1c8 (owner), i1e0.a4 (the int at +0xa4 of the object +0x1e0 points to), f-10 (negative offsets work)
+struct SnapField { char kind; int n; long long offs[6]; };
+static std::string g_snapPath;
+
+static bool ParseSnapField(const std::string& t, SnapField& f) {
+    if (t.size() < 2 || !strchr("ifbcsx", t[0])) return false;
+    f.kind = t[0]; f.n = 0;
+    size_t i = 1;
+    while (i < t.size() && f.n < 6) {
+        size_t j = t.find('.', i);
+        if (j == std::string::npos) j = t.size();
+        std::string part = t.substr(i, j - i);
+        char* end;
+        f.offs[f.n++] = strtoll(part.c_str(), &end, 16);
+        if (part.empty() || *end) return false;
+        i = j + 1;
+    }
+    return f.n > 0;
+}
+
+// One field of one object, as text; "?" if unreadable. SEH only (no C++ objects).
+static void RawSnapField(uint8_t* obj, const SnapField& f, char* out, size_t cap) {
+    __try {
+        uint8_t* p = obj;
+        for (int k = 0; k + 1 < f.n; k++) { p = *(uint8_t**)(p + f.offs[k]); if (!p) { strcpy_s(out, cap, "0"); return; } }
+        p += f.offs[f.n - 1];
+        switch (f.kind) {
+        case 'i': snprintf(out, cap, "%d", *(int*)p); break;
+        case 'f': snprintf(out, cap, "%.3f", *(float*)p); break;
+        case 'b': snprintf(out, cap, "%u", *(uint8_t*)p); break;
+        case 'x': snprintf(out, cap, "%llx", *(unsigned long long*)p); break;
+        case 'c': { char t[8]; if (RawTagOf(*(int*)p, t)) strcpy_s(out, cap, t); else snprintf(out, cap, "#%d", *(int*)p); break; }
+        case 's': {
+            const MsvcString* s = (const MsvcString*)p;
+            if (s->size > 200) { strcpy_s(out, cap, "?"); break; }
+            size_t n = std::min<size_t>(s->size, cap - 1);
+            memcpy(out, StrData(s), n);
+            out[n] = 0;
+            for (size_t i = 0; i < n; i++) if (out[i] == '\t' || out[i] == '\n' || out[i] == '\r') out[i] = ' ';
+            break;
+        }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { strcpy_s(out, cap, "?"); }
+}
+
+static std::string SnapCommand(const std::string& args) {
+    auto w = Words(args);
+    if (g_snapPath.empty()) {
+        g_snapPath = g_logPath;
+        g_snapPath.resize(g_snapPath.find_last_of('\\') + 1);
+        g_snapPath += "unit_snapshots.tsv";
+    }
+    if (!w.empty() && w[0] == "reset") {
+        if (w.size() > 1) g_snapPath = args.substr(args.find(w[1]));
+        FILE* f = nullptr;
+        fopen_s(&f, g_snapPath.c_str(), "w");
+        if (!f) return "FAIL can't write " + g_snapPath;
+        fclose(f);
+        return "OK " + g_snapPath;
+    }
+    if (w.size() < 3) return "FAIL usage: bridge.snap LABEL TYPE [class=CName] FIELD... | bridge.snap reset [PATH]";
+    EnsureCommandsPatched();
+    if (!g_resolve) return "FAIL no handle resolver";
+    int type = (int)strtol(w[1].c_str(), nullptr, 0);
+    std::string want;
+    std::vector<SnapField> fields;
+    for (size_t i = 2; i < w.size(); i++) {
+        if (w[i].rfind("class=", 0) == 0) { want = w[i].substr(6); continue; }
+        SnapField f;
+        if (!ParseSnapField(w[i], f)) return "FAIL bad field " + w[i];
+        fields.push_back(f);
+    }
+    FILE* out = nullptr;
+    fopen_s(&out, g_snapPath.c_str(), "a");
+    if (!out) return "FAIL can't write " + g_snapPath;
+    setvbuf(out, nullptr, _IOFBF, 1 << 20);
+    fprintf(out, "#snap\t%s\t%d", w[0].c_str(), type);
+    for (size_t i = 2; i < w.size(); i++) fprintf(out, "\t%s", w[i].c_str());
+    fprintf(out, "\n");
+    // Ids are handed out in order and objects die, so scan until a long run of misses.
+    int found = 0, miss = 0, last = 0;
+    char cls[96], v[256];
+    for (int id = 1; id < 2000000 && miss < 20000; id++) {
+        uint8_t* obj = (uint8_t*)RawResolve(type, id);
+        if (!obj) { miss++; continue; }
+        miss = 0; last = id;
+        if (!want.empty() && (!RawClassName(obj, cls) || want != cls)) continue;
+        fprintf(out, "%d", id);
+        for (auto& f : fields) { RawSnapField(obj, f, v, sizeof v); fprintf(out, "\t%s", v); }
+        fprintf(out, "\n");
+        found++;
+    }
+    fclose(out);
+    return "OK " + std::to_string(found) + " objects (ids to " + std::to_string(last) + ")";
+}
+
+// bridge.cmdrec [on [PATH] | off | mark TEXT | skip CLASS.. | unskip CLASS.. | owner TYPE HEXOFF[.HEXOFF..]]
+static std::string CmdRecCommand(const std::string& args) {
+    auto w = Words(args);
+    std::string a = w.empty() ? "" : w[0];
+    if (a == "on") {
+        if (!EnsureCommandsPatched()) return "FAIL could not find the command vtables (see console_bridge.log)";
+        std::string path;
+        if (w.size() > 1) path = args.substr(args.find(w[1]));
+        else {
+            path = g_logPath;
+            path.resize(path.find_last_of('\\') + 1);
+            path += "command_record.tsv";
+        }
+        AcquireSRWLockExclusive(&g_recLock);
+        if (g_recFile) fclose(g_recFile);
+        g_recFile = nullptr;
+        fopen_s(&g_recFile, path.c_str(), "w");
+        if (g_recFile) {
+            setvbuf(g_recFile, nullptr, _IOFBF, 1 << 20);
+            fprintf(g_recFile, "#seq\tms\tclass\towner\tvia\tmode\thandles\thex%#zx\textra\n", kRecBytes);
+            g_recSeq = 0;
+            g_recStart = GetTickCount64();
+            g_recPath = path;
+        }
+        g_recOn = g_recFile != nullptr;
+        ReleaseSRWLockExclusive(&g_recLock);
+        return g_recOn ? "OK recording to " + path : "FAIL can't write " + path;
+    }
+    if (a == "off") {
+        AcquireSRWLockExclusive(&g_recLock);
+        g_recOn = false;
+        if (g_recFile) fclose(g_recFile);
+        g_recFile = nullptr;
+        unsigned long long n = g_recSeq;
+        ReleaseSRWLockExclusive(&g_recLock);
+        return "OK recording off, " + std::to_string(n) + " commands in " + g_recPath;
+    }
+    if (a == "mark" && w.size() > 1) {
+        std::string text = args.substr(args.find(w[1]));
+        AcquireSRWLockExclusive(&g_recLock);
+        if (g_recFile) {
+            fprintf(g_recFile, "#mark\t%llu\t%s\n", GetTickCount64() - g_recStart, text.c_str());
+            fflush(g_recFile);
+        }
+        unsigned long long n = g_recSeq;
+        ReleaseSRWLockExclusive(&g_recLock);
+        return g_recOn ? "OK " + std::to_string(n) : "FAIL not recording";
+    }
+    if ((a == "skip" || a == "unskip") && w.size() > 1) {
+        AcquireSRWLockExclusive(&g_recLock);
+        for (size_t i = 1; i < w.size(); i++) { if (a == "skip") g_recSkip.insert(w[i]); else g_recSkip.erase(w[i]); }
+        ReleaseSRWLockExclusive(&g_recLock);
+        return "OK";
+    }
+    if ((a == "list" && w.size() == 5) || (a == "deref" && w.size() == 4) || (a == "rules" && w.size() == 3 && w[2] == "off")) {
+        AcquireSRWLockExclusive(&g_recLock);
+        if (a == "rules") g_recRules.erase(w[1]);
+        else {
+            RecRule r{ a == "list" ? 'L' : 'D', (int)strtol(w[2].c_str(), nullptr, 0), (int)strtol(w[3].c_str(), nullptr, 0),
+                       a == "list" ? (int)strtol(w[4].c_str(), nullptr, 0) : 0 };
+            bool ok = r.off >= 0 && r.off + 8 <= (int)kRecBytes && (r.kind == 'D' || (r.b >= 0 && r.b + 4 <= (int)kRecBytes));
+            if (ok) g_recRules[w[1]].push_back(r);
+            ReleaseSRWLockExclusive(&g_recLock);
+            return ok ? "OK" : "FAIL offsets must lie in the first 0xa0 bytes";
+        }
+        ReleaseSRWLockExclusive(&g_recLock);
+        return "OK";
+    }
+    if (a == "owner" && w.size() == 3) {
+        int type = (int)strtol(w[1].c_str(), nullptr, 0);
+        int offs[4], n = 0;
+        for (size_t pos = 0; pos <= w[2].size() && n < 4;) {   // "80.0.3c": hex offsets, pointers followed
+            size_t dot = w[2].find('.', pos);
+            if (dot == std::string::npos) dot = w[2].size();
+            offs[n++] = (int)strtol(w[2].substr(pos, dot - pos).c_str(), nullptr, 16);
+            pos = dot + 1;
+        }
+        int i = 0;
+        while (i < g_recOwnerN && g_recOwnerType[i] != type) i++;
+        if (i == 16) return "FAIL too many owner types";
+        // set while recording may be read mid-change by the game thread; only done between runs in practice
+        for (int j = 0; j < n; j++) g_recOwnerOff[i][j] = offs[j];
+        g_recOwnerLen[i] = n;
+        g_recOwnerType[i] = type;
+        if (i == g_recOwnerN) g_recOwnerN++;
+        return "OK";
+    }
+    if (a.empty()) {
+        std::string out = std::string("OK recording ") + (g_recOn ? "on, " + std::to_string(g_recSeq) + " commands in " + g_recPath : "off");
+        out += " owners:";
+        for (int i = 0; i < g_recOwnerN; i++) {
+            char b[16];
+            snprintf(b, sizeof b, " %d@", g_recOwnerType[i]);
+            out += b;
+            for (int j = 0; j < g_recOwnerLen[i]; j++) { snprintf(b, sizeof b, j ? ".%x" : "%x", g_recOwnerOff[i][j]); out += b; }
+        }
+        out += " skip:";
+        for (auto& s : g_recSkip) out += " " + s;
+        return out;
+    }
+    return "FAIL usage: bridge.cmdrec [on [PATH] | off | mark TEXT | skip CLASS.. | unskip CLASS.. | owner TYPE OFF | list CLASS PTR COUNT STRIDE | deref CLASS PTR FIELD | rules CLASS off]";
+}
+
+// ---- bridge.move: order a division (any country's) to a province, the way the game's own move code does it:
+// build a CMoveCommand on the stack, check it (vtable slot 9), execute it (slot 10), destroy it (slot 0).
+// CMoveCommand(cmd, CArmy* unit, int province, bool, int, bool x5): the flags are those of a player's move
+// (1, 2, 1, 0, 0, 0, 0). The unit pointer is the object a handle resolves to minus 0x10 (its handle is at +0x18).
+using MoveCtorFn = void*(__fastcall*)(void* cmd, void* unit, int province, char b4, int i5, char b6, char b7, char b8,
+                                      char b9, char b10);
+using ValidFn = char(__fastcall*)(void* cmd, void* arg);
+using DtorFn = void*(__fastcall*)(void* cmd, int flags);
+static MoveCtorFn g_moveCtor;
+static void** g_moveVt;
+
+// The CMoveCommand constructor: a command constructor prologue whose vtable lea loads CMoveCommand's vtable.
+static bool FindMoveCtor() {
+    if (g_moveCtor) return true;
+    for (auto& kv : g_cmdName) if (kv.second == "CMoveCommand") g_moveVt = (void**)kv.first;
+    if (!g_moveVt) return false;
+    const char* pat = "48 89 4C 24 08 53 48 83 EC 60 48 8B D9 C6 41 08 00 C7 41 0C FF FF FF FF 33 C0 48 89 41 10 "
+                      "33 C9 48 89 4B 10 C7 43 18 FF FF 00 00 48 89 4B 1C 48 8D 05";
+    for (uint8_t* c = g_textStart; (c = FindPattern(c, g_textEnd, pat)) != nullptr; c++) {
+        uint8_t* lea = c + 0x2f;   // 48 8D 05 rel32
+        if (Rel32(lea, 3, 7) == (uint8_t*)g_moveVt) { g_moveCtor = (MoveCtorFn)c; break; }
+    }
+    Log("move: CMoveCommand vtable %p ctor %p", g_moveVt, g_moveCtor);
+    return g_moveCtor != nullptr;
+}
+
+// 1 executed, 0 the game's check refused it, -1 crashed. SEH only.
+static int RawMove(void* unit, int province, const char f[7]) {
+    alignas(16) uint8_t cmd[0x100] = {};
+    bool built = false;
+    __try {
+        g_moveCtor(cmd, unit, province, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
+        built = true;
+        void** vt = *(void***)cmd;
+        int r = 0;
+        if (((ValidFn)vt[9])(cmd, nullptr)) {
+            t_bridgeIssued = true;
+            ((CmdExecFn)vt[10])(cmd, nullptr, nullptr, nullptr);   // through hk_cmdExec, so it is recorded
+            t_bridgeIssued = false;
+            r = 1;
+        }
+        ((DtorFn)vt[0])(cmd, 0);
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return built ? -1 : -2;
+    }
+}
+
+// ---- bridge.protect: keep the game from stopping divisions we move.
+// A unit's path lives at +0x2c0 of the full division object. ClearPath(unit) empties it, and CancelMovement(unit,
+// bool) empties it too (directly), e.g. for the AI's CCancelMovementCommand, whose divisions sit in a list so its
+// owner isn't found. The hooks refuse both for a protected division unless the bridge itself is moving it, and
+// count who tried (by return address).
+using ClearPathFn = void(__fastcall*)(uint8_t* unit);
+static ClearPathFn o_clearPath;
+using CancelMoveFn = void(__fastcall*)(uint8_t* unit, char flag);
+static CancelMoveFn o_cancelMove;
+static bool g_protReady = false;
+static SRWLOCK g_protLock = SRWLOCK_INIT;
+static std::set<int> g_protIds;                        // division handle ids
+static std::map<uintptr_t, int> g_protCallers;         // caller rva -> refused ClearPath calls
+static volatile bool g_protOn = false;
+
+// True if the game should leave this unit's path alone; counts the caller.
+static bool Protected(uint8_t* unit, void* ret) {
+    if (!g_protOn || t_bridgeIssued) return false;
+    int h[2] = { 0, 0 };
+    RawBytes(unit + 0x18, (uint8_t*)h, 8);
+    if (h[0] != 51) return false;
+    AcquireSRWLockExclusive(&g_protLock);
+    bool mine = g_protIds.count(h[1]) > 0;
+    if (mine) g_protCallers[(uintptr_t)((uint8_t*)ret - g_base)]++;
+    ReleaseSRWLockExclusive(&g_protLock);
+    return mine;
+}
+
+static void __fastcall hk_clearPath(uint8_t* unit) {
+    if (!Protected(unit, _ReturnAddress())) o_clearPath(unit);
+}
+
+static void __fastcall hk_cancelMove(uint8_t* unit, char flag) {
+    if (!Protected(unit, _ReturnAddress())) o_cancelMove(unit, flag);
+}
+
+static bool EnsureProtectHook() {
+    if (g_protReady) return true;
+    uint8_t* f = FindPattern(g_textStart, g_textEnd,
+        "40 53 48 83 EC 20 48 8B D9 48 81 C1 C0 02 00 00 E8 ?? ?? ?? ?? C7 83 2C 02 00 00 00 00 00 00 48 83 C4 20 5B C3");
+    if (!f) { Log("protect: ClearPath not found"); return false; }
+    uint8_t* c = FindPattern(g_textStart, g_textEnd,
+        "48 89 5C 24 10 48 89 74 24 20 55 57 41 54 41 56 41 57 48 8B EC 48 83 EC 60 44 0F B6 E2 48 8B D9 C6 81 AC 02 00 00 00");
+    if (!c) { Log("protect: CancelMovement not found"); return false; }
+    g_protReady = MH_CreateHook(f, &hk_clearPath, (void**)&o_clearPath) == MH_OK && MH_EnableHook(f) == MH_OK &&
+                  MH_CreateHook(c, &hk_cancelMove, (void**)&o_cancelMove) == MH_OK && MH_EnableHook(c) == MH_OK;
+    Log("protect: ClearPath hoi4+%#llx, CancelMovement hoi4+%#llx hooked: %d", (unsigned long long)(f - g_base),
+        (unsigned long long)(c - g_base), g_protReady);
+    return g_protReady;
+}
+
+// bridge.protect [add ID.. | remove ID.. | clear | callers]
+static std::string ProtectCommand(const std::string& args) {
+    auto w = Words(args);
+    if (!EnsureProtectHook()) return "FAIL ClearPath hook not available (see console_bridge.log)";
+    std::string out = "OK";
+    AcquireSRWLockExclusive(&g_protLock);
+    if (!w.empty() && (w[0] == "add" || w[0] == "remove"))
+        for (size_t i = 1; i < w.size(); i++) { int id = atoi(w[i].c_str()); if (w[0] == "add") g_protIds.insert(id); else g_protIds.erase(id); }
+    else if (w.size() == 1 && w[0] == "clear") g_protIds.clear();
+    else if (w.size() == 1 && w[0] == "callers") {
+        for (auto& kv : g_protCallers) { char b[48]; snprintf(b, sizeof b, " hoi4+%#llx=%d", (unsigned long long)kv.first, kv.second); out += b; }
+        g_protCallers.clear();
+    } else if (!w.empty()) out = "FAIL usage: bridge.protect [add ID.. | remove ID.. | clear | callers]";
+    g_protOn = !g_protIds.empty();
+    if (w.empty()) out += " " + std::to_string(g_protIds.size()) + " protected divisions";
+    ReleaseSRWLockExclusive(&g_protLock);
+    return out;
+}
+
+// ---- bridge.watch: a hardware write watchpoint (research): debug register 0 on every thread of the game, a
+// vectored handler counts the writing instructions with a rough call stack (return addresses found on the stack).
+struct WatchHit { uintptr_t rip; uintptr_t stack[6]; volatile LONG count; };
+static WatchHit g_watchHits[64];
+static volatile LONG g_watchN = 0;
+static PVOID g_watchVeh = nullptr;
+static uintptr_t g_watchAddr = 0;
+
+static LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    if (!(c->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    c->Dr6 = 0;
+    uintptr_t rip = c->Rip - (uintptr_t)g_base, st[6] = {};
+    const uintptr_t* sp = (const uintptr_t*)c->Rsp;
+    for (int i = 0, k = 0; i < 200 && k < 6; i++)
+        if (sp[i] >= (uintptr_t)g_textStart && sp[i] < (uintptr_t)g_textEnd) st[k++] = sp[i] - (uintptr_t)g_base;
+    LONG n = g_watchN < 64 ? g_watchN : 64;
+    for (LONG i = 0; i < n; i++)
+        if (g_watchHits[i].rip == rip && g_watchHits[i].stack[0] == st[0] && g_watchHits[i].stack[1] == st[1]) {
+            InterlockedIncrement(&g_watchHits[i].count);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    LONG i = InterlockedIncrement(&g_watchN) - 1;
+    if (i < 64) { g_watchHits[i].rip = rip; memcpy(g_watchHits[i].stack, st, sizeof st); g_watchHits[i].count = 1; }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// Sets (addr != 0) or clears debug register 0 on every other thread of the process. Runs on its own thread so
+// that it can suspend the game's threads, the caller included.
+static DWORD WINAPI WatchSetAll(LPVOID addrp) {
+    uintptr_t addr = (uintptr_t)addrp;
+    DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId(), n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te{ sizeof te };
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+        HANDLE h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (!h) continue;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT c{};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &c)) {
+                c.Dr7 &= ~0xF0003ull;                                   // DR0: local enable, RW, LEN
+                if (addr) { c.Dr0 = addr; c.Dr7 |= 1 | (1ull << 16) | (3ull << 18); }   // write, 4 bytes
+                if (SetThreadContext(h, &c)) n++;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+// bridge.watch ADDR | div ID OFF | hits | off
+static std::string WatchCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() == 1 && w[0] == "hits") {
+        std::string out = "OK";
+        LONG n = g_watchN < 64 ? g_watchN : 64;
+        for (LONG i = 0; i < n; i++) {
+            char b[200];
+            int k = snprintf(b, sizeof b, " hoi4+%#llx x%ld <", (unsigned long long)g_watchHits[i].rip, g_watchHits[i].count);
+            for (int j = 0; j < 6 && g_watchHits[i].stack[j]; j++)
+                k += snprintf(b + k, sizeof b - k, "%s%llx", j ? "," : "", (unsigned long long)g_watchHits[i].stack[j]);
+            snprintf(b + k, sizeof b - k, ">");
+            out += b;
+        }
+        return out;
+    }
+    uintptr_t addr = 0;
+    if (w.size() == 1 && w[0] == "off") addr = 0;
+    else if (w.size() == 3 && w[0] == "div") {
+        EnsureCommandsPatched();
+        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[1].c_str()));
+        if (!obj) return "FAIL no division " + w[1];
+        addr = (uintptr_t)(obj - 0x10 + strtol(w[2].c_str(), nullptr, 16));   // offset into the full object
+    } else if (w.size() == 1) addr = (uintptr_t)strtoull(w[0].c_str(), nullptr, 16);
+    else return "FAIL usage: bridge.watch ADDR | div ID HEXOFF | hits | off";
+    if (addr & 3) return "FAIL address must be 4-aligned";
+    if (addr && !g_watchVeh) g_watchVeh = AddVectoredExceptionHandler(1, WatchVeh);
+    g_watchN = 0;
+    g_watchAddr = addr;
+    HANDLE t = CreateThread(nullptr, 0, WatchSetAll, (LPVOID)addr, 0, nullptr);
+    DWORD n = 0;
+    if (t) { WaitForSingleObject(t, 5000); GetExitCodeThread(t, &n); CloseHandle(t); }
+    char b[96];
+    snprintf(b, sizeof b, "OK watch %s %#llx on %lu threads", addr ? "on" : "off", (unsigned long long)addr, n);
+    return b;
+}
+
+// bridge.move DIVISION_ID PROVINCE [b4 i5 b6 b7 b8 b9 b10]
+static std::string MoveCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() != 2 && w.size() != 9) return "FAIL usage: bridge.move DIVISION_ID PROVINCE [7 flags]";
+    if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
+    if (!FindMoveCtor()) return "FAIL CMoveCommand constructor not found";
+    int id = atoi(w[0].c_str()), prov = atoi(w[1].c_str());
+    char f[7] = { 1, 2, 1, 0, 0, 0, 0 };
+    if (w.size() == 9) for (int i = 0; i < 7; i++) f[i] = (char)atoi(w[2 + i].c_str());
+    uint8_t* obj = (uint8_t*)RawResolve(51, id);
+    char cls[96];
+    if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[0];
+    char tag[8] = "?";
+    int owner = 0;
+    if (RawBytes(obj + 0x1c8, (uint8_t*)&owner, 4)) RawTagOf(owner, tag);
+    int r = RawMove(obj - 0x10, prov, f);
+    if (r == 1) return "OK " + std::string(tag) + " division " + w[0] + " ordered to province " + w[1];
+    if (r == 0) return "FAIL the game refused the move (province unreachable or not allowed)";
+    return r == -1 ? "ERROR crashed while executing the move" : "ERROR crashed while building the move";
+}
+
 static void __fastcall hk_execCmd(void* cmd, int depth) {
     int prev = t_cmdDepth;
     t_cmdDepth = depth;
@@ -1161,6 +2097,29 @@ static std::string WarsCommand(const std::string& args) {
 
 static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd == "bridge.wars" || cmd.rfind("bridge.wars ", 0) == 0) return WarsCommand(cmd.substr(11));
+    if (cmd == "bridge.cmdlog" || cmd.rfind("bridge.cmdlog ", 0) == 0) return CmdLogCommand(cmd.substr(13));
+    if (cmd == "bridge.cmdblock" || cmd.rfind("bridge.cmdblock ", 0) == 0) return CmdBlockCommand(cmd.substr(15));
+    if (cmd == "bridge.cmdrec" || cmd.rfind("bridge.cmdrec ", 0) == 0) return CmdRecCommand(cmd.substr(13));
+    if (cmd.rfind("bridge.object ", 0) == 0) return ObjectCommand(cmd.substr(14));
+    if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
+    if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
+    if (cmd.rfind("bridge.watch ", 0) == 0) return WatchCommand(cmd.substr(13));
+    if (cmd == "bridge.protect" || cmd.rfind("bridge.protect ", 0) == 0) return ProtectCommand(cmd.substr(14));
+    if (cmd == "bridge.snap" || cmd.rfind("bridge.snap ", 0) == 0) return SnapCommand(cmd.substr(11));
+    if (cmd.rfind("bridge.tag ", 0) == 0) {
+        if (!g_dataReady) return "ERROR country data support not active";
+        std::string out = "OK";
+        const char* p = cmd.c_str() + 11;
+        while (*p) {
+            char* end;
+            long id = strtol(p, &end, 0);
+            if (end == p) break;
+            char t[8];
+            out += " " + std::to_string(id) + "=" + (RawTagOf((int)id, t) ? t : "?");
+            p = end;
+        }
+        return out;
+    }
     if (cmd == "bridge.treaties" || cmd.rfind("bridge.treaties ", 0) == 0) return SetTreatyPairs(cmd.substr(15));
     if (cmd.rfind("bridge.query ", 0) == 0) return Query(cmd.substr(13));
     if (cmd.rfind("bridge.loc ", 0) == 0) return LocLookup(cmd.substr(11));
