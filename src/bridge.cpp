@@ -2160,13 +2160,15 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
 
 // ---- bridge.plan: battle plans as the game's army UI makes them (recorded from a player drawing them).
 // A front line is a stretch of a CFront (handle type 66: the border between one of our areas and an enemy area in a
-// theatre; +0x20 its list of our border provinces in order, +0x58 the front sections drawn on it).
+// theatre; +0x20 its border provinces (unordered), +0x58 its CFrontSections: connected stretches, each with our
+// provinces in order at +0x30 and (ours, theirs) pairs at +0x48). START..END run along the sections in turn.
 //   COrderNewRootCommand (front line): +0x28 army handle, +0x30 division handles {data, cap, count} + allocator,
 //     +0x48 CFront handle, +0x50 2, +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
 //     percent (0..100000), +0x70 the CFront's section count + 1, +0x74 1, +0x80 an empty list.
 //   COrderNewFrontCommand (offensive line): +0x28 / +0x30 army handle, +0x38 division handles, +0x50 province ids
 //     of the line's points (the last one the target), +0x68 1, +0x70 1.
 //   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
+//   COrderDeleteCommand: +0x28 army handle (deletes the army's plan).
 // Built by hand, checked, executed and not destroyed (their lists point at memory we never free).
 static void** VtableOf(const char* cls) {
     for (auto& kv : g_cmdName) if (kv.second == cls) return (void**)kv.first;
@@ -2227,11 +2229,11 @@ static std::string RunReply(int r, const char* what) {
     return std::string("ERROR crashed on the ") + what;
 }
 
-// bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1]
+// bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1] | delete ARMY
 static std::string PlanCommand(const std::string& args) {
     auto w = Words(args);
     const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END DIVISION_ID.. | "
-                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1]";
+                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | delete ARMY_ID";
     if (w.size() < 2) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
     int armyId = atoi(w[1].c_str());
@@ -2283,6 +2285,12 @@ static std::string PlanCommand(const std::string& args) {
         *(int*)(cmd + 0x68) = 1;
         *(uint8_t*)(cmd + 0x70) = 1;
         return RunReply(RunHandBuilt(cmd), "offensive line");
+    }
+    if (w[0] == "delete") {   // COrderDeleteCommand: +0x28 army handle; removes the army's plan, not the army
+        uint8_t* cmd = NewHandBuilt("COrderDeleteCommand");
+        if (!cmd) return "FAIL COrderDeleteCommand vtable not found";
+        *(uint64_t*)(cmd + 0x28) = army;
+        return RunReply(RunHandBuilt(cmd), "plan deletion");
     }
     if (w[0] == "execute") {
         uint8_t* cmd = NewHandBuilt("COrderExecuteCommand");
