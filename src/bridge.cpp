@@ -2169,6 +2169,8 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
 //     of the line's points (the last one the target), +0x68 an id the game's check wants (found by trying), +0x70 1.
 //   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
 //   COrderDeleteCommand: +0x28 army handle (deletes the army's plan).
+//   CSetOrderGroupCohesionTypeCommand: +0x28 army handle, +0x30 0 flexible, 1 balanced, 2 rigid, 3 immobile (the
+//     army keeps its plan and builds planning, but the game doesn't move its divisions).
 // Built by hand, checked, executed and not destroyed (their lists point at memory we never free).
 static void** VtableOf(const char* cls) {
     for (auto& kv : g_cmdName) if (kv.second == cls) return (void**)kv.first;
@@ -2229,11 +2231,12 @@ static std::string RunReply(int r, const char* what) {
     return std::string("ERROR crashed on the ") + what;
 }
 
-// bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1] | delete ARMY
+// bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1] | delete ARMY | cohesion ARMY 0-3
 static std::string PlanCommand(const std::string& args) {
     auto w = Words(args);
     const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END DIVISION_ID.. | "
-                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | delete ARMY_ID";
+                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | delete ARMY_ID | "
+                        "cohesion ARMY_ID 0-3";
     if (w.size() < 2) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
     int armyId = atoi(w[1].c_str());
@@ -2294,6 +2297,13 @@ static std::string PlanCommand(const std::string& args) {
         char b[64];
         snprintf(b, sizeof b, "OK offensive line (id %d)", id - 1);
         return b;
+    }
+    if (w[0] == "cohesion" && w.size() >= 3) {   // CSetOrderGroupCohesionTypeCommand: +0x28 army, +0x30 type
+        uint8_t* cmd = NewHandBuilt("CSetOrderGroupCohesionTypeCommand");
+        if (!cmd) return "FAIL CSetOrderGroupCohesionTypeCommand vtable not found";
+        *(uint64_t*)(cmd + 0x28) = army;
+        *(int*)(cmd + 0x30) = atoi(w[2].c_str());
+        return RunReply(RunHandBuilt(cmd), "cohesion");
     }
     if (w[0] == "delete") {   // COrderDeleteCommand: +0x28 army handle; removes the army's plan, not the army
         uint8_t* cmd = NewHandBuilt("COrderDeleteCommand");
