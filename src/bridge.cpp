@@ -1337,7 +1337,10 @@ static bool BlockOwner(void* self, const BlockRule& r, char tag[8], const std::s
     return OwnerFromLists(name, b, tag) || RecOwnerFromHandles(b, tag, &via);
 }
 
-static void RecordCommand(const std::string& name, void* self) {
+static thread_local int t_execDepth = 0;  // hooked Executes running on this thread now (1 = the outermost)
+
+// DROPPED: bridge.cmdblock dropped it. DEPTH=N: it ran inside N-1 other commands' Execute.
+static void RecordCommand(const std::string& name, void* self, bool dropped) {
     uint8_t bytes[kRecBytes];
     if (!RawBytes(self, bytes, sizeof bytes)) memset(bytes, 0, sizeof bytes);
     AcquireSRWLockShared(&g_recLock);
@@ -1345,6 +1348,8 @@ static void RecordCommand(const std::string& name, void* self) {
     auto rr = g_recRules.find(name);
     std::string extra = skip ? "" : RecExtra(bytes, rr == g_recRules.end() ? nullptr : &rr->second);
     if (t_bridgeIssued) extra = (extra == "-" ? "" : extra + " ") + "SRC=bridge";
+    if (dropped) extra = (extra == "-" ? "" : extra + " ") + "DROPPED";
+    if (t_execDepth > 0) extra = (extra == "-" ? "" : extra + " ") + "DEPTH=" + std::to_string(t_execDepth + 1);
     ReleaseSRWLockShared(&g_recLock);
     if (skip) return;
     char tag[8] = "-", via[16] = "-";
@@ -1380,7 +1385,18 @@ static void __fastcall hk_cmdExec(void* self, void* a, void* b, void* c) {
     auto it = g_cmdOrig.find(vt);
     if (it == g_cmdOrig.end()) return;   // can't happen: only patched vtables lead here
     const std::string& name = g_cmdName.find(vt)->second;
-    if (g_recOn) RecordCommand(name, self);   // before Execute: the command and its objects are as sent
+    bool drop = false;
+    if (g_blockOn && !t_bridgeIssued) {
+        char tag[8];
+        AcquireSRWLockExclusive(&g_blockLock);
+        auto r = g_blockRules.find(name);
+        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag, name) && g_blockTags.count(tag)) {
+            drop = true;
+            g_blockDropped[name + ":" + tag]++;
+        }
+        ReleaseSRWLockExclusive(&g_blockLock);
+    }
+    if (g_recOn) RecordCommand(name, self, drop);   // before Execute: the command and its objects are as sent
     if (g_cmdLogOn) {
         uintptr_t caller = (uintptr_t)((uint8_t*)_ReturnAddress() - g_base);
         AcquireSRWLockExclusive(&g_cmdLogLock);
@@ -1391,19 +1407,10 @@ static void __fastcall hk_cmdExec(void* self, void* a, void* b, void* c) {
         ReleaseSRWLockExclusive(&g_cmdLogLock);
         if (sample) LogCommandSample(name, caller, self);
     }
-    if (g_blockOn && !t_bridgeIssued) {
-        bool drop = false;
-        char tag[8];
-        AcquireSRWLockExclusive(&g_blockLock);
-        auto r = g_blockRules.find(name);
-        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag, name) && g_blockTags.count(tag)) {
-            drop = true;
-            g_blockDropped[name + ":" + tag]++;
-        }
-        ReleaseSRWLockExclusive(&g_blockLock);
-        if (drop) return;
-    }
+    if (drop) return;
+    t_execDepth++;
     it->second(self, a, b, c);
+    t_execDepth--;
 }
 
 // Finds the command vtables from RTTI and patches their Execute slot. Once, on the game's main thread.
@@ -1434,8 +1441,11 @@ static int PatchCommandVtables() {
         size_t at = name.find("@@");
         if (at == std::string::npos) continue;
         name.resize(at);
+        // "...Commands" too: COrderRemoveRootCommands, COrderReplaceRootCommands, COrderReplaceFallbackCommands
+        // (battle plan commands that run other commands' Execute directly); the vtable check below keeps CCommands only
+        auto endsWith = [&](const char* s) { size_t n = strlen(s); return name.size() > n && name.compare(name.size() - n, n, s) == 0; };
         if (name == "CCommand") baseCol = p;
-        else if (name.size() > 7 && name.compare(name.size() - 7, 7, "Command") == 0) cols[p] = name;
+        else if (endsWith("Command") || endsWith("Commands")) cols[p] = name;
     }
     if (!baseCol) { Log("cmdlog: CCommand RTTI not found"); return -1; }
 
