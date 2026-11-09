@@ -1243,6 +1243,8 @@ static std::map<std::string, std::vector<RecRule>> g_recRules = {
     { "COrderAssignCommand",   { { 'L', 0x28, 0x30, 8 } } },
     { "COrderUnassignCommand", { { 'L', 0x28, 0x30, 8 } } },
     { "COrderNewFrontCommand", { { 'L', 0x38, 0x40, 8 }, { 'L', 0x50, 0x5c, 4 } } },   // divisions; provinces?
+    { "CRemoveFromArmyGroupCommand", { { 'L', 0x28, 0x34, 8 } } },   // armies taken out of their army group
+    { "CCancelMovementCommand",      { { 'L', 0x28, 0x34, 8 } } },   // divisions whose movement is cancelled
 };
 
 static std::string RecExtra(const uint8_t* bytes, const std::vector<RecRule>* rules) {
@@ -1278,34 +1280,59 @@ static std::string RecExtra(const uint8_t* bytes, const std::vector<RecRule>* ru
     return out.empty() ? "-" : out.substr(1);
 }
 
+// The owner of the object a handle names, if its type has a known owner offset (bridge.cmdrec owner).
+static bool OwnerOfHandle(int type, int id, char tag[8]) {
+    if (id < 1) return false;
+    uint8_t* obj = nullptr;
+    for (int k = 0; k < g_recOwnerN; k++) {
+        if (g_recOwnerType[k] != type) continue;
+        if (!obj && !(obj = (uint8_t*)RawResolve(type, id))) return false;
+        uint8_t* p = obj;
+        for (int j = 0; p && j + 1 < g_recOwnerLen[k]; j++)
+            if (!RawBytes(p + g_recOwnerOff[k][j], (uint8_t*)&p, 8)) p = nullptr;
+        int c;
+        if (p && RawBytes(p + g_recOwnerOff[k][g_recOwnerLen[k] - 1], (uint8_t*)&c, 4) && RawTagOf(c, tag)) return true;
+    }
+    return false;
+}
+
 // Owner from the first handle in the command whose type has a known owner offset. No SEH needed here.
 static bool RecOwnerFromHandles(const uint8_t* bytes, char tag[8], int* via) {
     for (size_t o = 0x24; o + 8 <= kRecBytes; o += 4) {
         int type = *(const int*)(bytes + o), id = *(const int*)(bytes + o + 4);
-        if (id < 1) continue;
-        uint8_t* obj = nullptr;
-        for (int k = 0; k < g_recOwnerN; k++) {
-            if (g_recOwnerType[k] != type) continue;
-            if (!obj && !(obj = (uint8_t*)RawResolve(type, id))) break;
-            uint8_t* p = obj;
-            for (int j = 0; p && j + 1 < g_recOwnerLen[k]; j++)
-                if (!RawBytes(p + g_recOwnerOff[k][j], (uint8_t*)&p, 8)) p = nullptr;
-            int c;
-            if (p && RawBytes(p + g_recOwnerOff[k][g_recOwnerLen[k] - 1], (uint8_t*)&c, 4) && RawTagOf(c, tag)) {
-                *via = (int)o;
-                return true;
-            }
+        if (OwnerOfHandle(type, id, tag)) {
+            *via = (int)o;
+            return true;
         }
     }
     return false;
 }
 
-// The owner of a command under a rule, including auto rules.
-static bool BlockOwner(void* self, const BlockRule& r, char tag[8]) {
+// Owner from the handles in the class's list rules (bridge.cmdrec list, 8-byte entries): the first that has one.
+static bool OwnerFromLists(const std::string& name, const uint8_t* bytes, char tag[8]) {
+    AcquireSRWLockShared(&g_recLock);
+    auto it = g_recRules.find(name);
+    std::vector<RecRule> rules = it == g_recRules.end() ? std::vector<RecRule>() : it->second;
+    ReleaseSRWLockShared(&g_recLock);
+    for (auto& r : rules) {
+        if (r.kind != 'L' || r.c != 8) continue;
+        const uint8_t* data = *(const uint8_t* const*)(bytes + r.off);
+        int n = *(const int*)(bytes + r.b);
+        for (int i = 0; i < n && i < 8; i++) {
+            int h[2];
+            if (RawBytes(data + (size_t)i * 8, (uint8_t*)h, 8) && OwnerOfHandle(h[0], h[1], tag)) return true;
+        }
+    }
+    return false;
+}
+
+// The owner of a command under a rule, including auto rules (a handle in the command, else one in its lists).
+static bool BlockOwner(void* self, const BlockRule& r, char tag[8], const std::string& name) {
     if (r.handleOff != -2) return RawOwner(self, r, tag);
     uint8_t b[kRecBytes];
     int via;
-    return RawBytes(self, b, sizeof b) && RecOwnerFromHandles(b, tag, &via);
+    if (!RawBytes(self, b, sizeof b)) return false;
+    return RecOwnerFromHandles(b, tag, &via) || OwnerFromLists(name, b, tag);
 }
 
 static void RecordCommand(const std::string& name, void* self) {
@@ -1323,7 +1350,7 @@ static void RecordCommand(const std::string& name, void* self) {
     {
         AcquireSRWLockShared(&g_blockLock);
         auto r = g_blockRules.find(name);
-        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag)) { found = true; strcpy_s(via, "rule"); }
+        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag, name)) { found = true; strcpy_s(via, "rule"); }
         ReleaseSRWLockShared(&g_blockLock);
     }
     int vo;
@@ -1367,7 +1394,7 @@ static void __fastcall hk_cmdExec(void* self, void* a, void* b, void* c) {
         char tag[8];
         AcquireSRWLockExclusive(&g_blockLock);
         auto r = g_blockRules.find(name);
-        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag) && g_blockTags.count(tag)) {
+        if (r != g_blockRules.end() && BlockOwner(self, r->second, tag, name) && g_blockTags.count(tag)) {
             drop = true;
             g_blockDropped[name + ":" + tag]++;
         }
