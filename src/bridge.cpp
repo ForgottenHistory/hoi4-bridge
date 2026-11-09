@@ -1155,9 +1155,10 @@ static bool RawClassName(void* obj, char out[96]) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// The object a {type, id} handle names, or null. Types 1..99 only (the table range). SEH only.
+// The object a {type, id} handle names, or null. Most types are small (51 division, 53 order, 67 theatre); unit
+// leaders are 4713. SEH only.
 static void* RawResolve(int type, int id) {
-    if (!g_resolve || type < 1 || type > 99 || id < 1) return nullptr;
+    if (!g_resolve || type < 1 || type > 0xffff || id < 1) return nullptr;
     int h[2] = { type, id };
     __try { return g_resolve(h); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
@@ -1998,6 +1999,126 @@ static std::string WatchCommand(const std::string& args) {
     return b;
 }
 
+// ---- bridge.army: build armies and give them leaders, as the game's army UI does.
+// COrderGroupCommand(cmd, vector<handle>* divisions, CTheatre* theatre, obj* extra): its Execute creates an army
+// ("orders group") of the given divisions in the theatre (only divisions of the theatre's country are kept).
+// CSetArmyLeaderCommand(cmd, unit leader*, army*, bool): Execute makes the leader the army's commander.
+// Both are built on the stack, checked (slot 9), executed (slot 10) and destroyed (slot 0), like bridge.move.
+// Their constructors are found by a prologue pattern plus a lea of the class's own vtable within it.
+using OrderGroupCtorFn = void*(__fastcall*)(void* cmd, void* units, void* theatre, void* extra);
+using SetLeaderCtorFn = void*(__fastcall*)(void* cmd, void* leader, void* army, char flag);
+static OrderGroupCtorFn g_orderGroupCtor;
+static SetLeaderCtorFn g_setLeaderCtor;
+
+static uint8_t* FindCtorFor(const char* cls, const char* pat) {
+    void** vt = nullptr;
+    for (auto& kv : g_cmdName) if (kv.second == cls) vt = (void**)kv.first;
+    if (!vt) return nullptr;
+    for (uint8_t* c = g_textStart; (c = FindPattern(c, g_textEnd, pat)) != nullptr; c++)
+        for (int i = 0; i < 0x80 && c + i + 7 < g_textEnd; i++)
+            if (c[i] == 0x48 && c[i + 1] == 0x8D && c[i + 2] == 0x05 && Rel32(c + i, 3, 7) == (uint8_t*)vt) return c;
+    return nullptr;
+}
+
+static bool FindArmyCtors() {
+    if (!g_orderGroupCtor)
+        g_orderGroupCtor = (OrderGroupCtorFn)FindCtorFor("COrderGroupCommand",
+            "48 89 5C 24 10 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 30 49 8B D9 4D 8B E8 4C 8B FA "
+            "4C 8B F1 C6 41 08 00 C7 41 0C FF FF FF FF 33 F6 48 89 71 10 C7 41 18 FF FF 00 00 48 89 71 1C 48 8D 05");
+    if (!g_setLeaderCtor)
+        g_setLeaderCtor = (SetLeaderCtorFn)FindCtorFor("CSetArmyLeaderCommand",
+            "48 89 5C 24 10 48 89 74 24 18 48 89 4C 24 08 57 48 83 EC 30 41 0F B6 F1 49 8B F8 48 8B D9 C6 41 08 00 "
+            "C7 41 0C FF FF FF FF 33 C0 48 89 41 10 33 C9 48 89 4B 10 C7 43 18 FF FF 00 00 48 89 4B 1C 48 8D 05");
+    Log("army: COrderGroupCommand ctor %p, CSetArmyLeaderCommand ctor %p", g_orderGroupCtor, g_setLeaderCtor);
+    return g_orderGroupCtor && g_setLeaderCtor;
+}
+
+// Check and execute a command built in CMD, then destroy it: 1 executed, 0 refused by the game's check, -1 crashed.
+static int RunBuilt(uint8_t* cmd) {
+    __try {
+        void** vt = *(void***)cmd;
+        int r = 0;
+        if (((ValidFn)vt[9])(cmd, nullptr)) {
+            t_bridgeIssued = true;
+            ((CmdExecFn)vt[10])(cmd, nullptr, nullptr, nullptr);
+            t_bridgeIssued = false;
+            r = 1;
+        }
+        ((DtorFn)vt[0])(cmd, 0);
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return -1;
+    }
+}
+
+static int OrderIdOf(uint8_t* division) {   // the army / front a division is in (its COrdersGroup's id), 0 if none
+    uint8_t* order = nullptr;
+    int id = 0;
+    if (!RawBytes(division + 0xb0, (uint8_t*)&order, 8) || !order) return 0;
+    return RawBytes(order + 0xc, (uint8_t*)&id, 4) ? id : 0;
+}
+
+static int RawCreateArmy(uint64_t* handles, int n, void* theatre) {
+    struct { uint64_t* data; int cap; int count; } vec = { handles, n, n };
+    alignas(16) uint8_t cmd[0x100] = {};
+    __try { g_orderGroupCtor(cmd, &vec, theatre, nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    return RunBuilt(cmd);
+}
+
+static int RawSetLeader(void* leader, void* army) {
+    alignas(16) uint8_t cmd[0x100] = {};
+    __try { g_setLeaderCtor(cmd, leader, army, 0); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    return RunBuilt(cmd);
+}
+
+// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID
+static std::string ArmyCommand(const std::string& args) {
+    auto w = Words(args);
+    const char* usage = "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID";
+    if (w.empty()) return usage;
+    if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
+    if (!FindArmyCtors()) return "FAIL army command constructors not found";
+    char cls[96];
+    if (w[0] == "create" && w.size() >= 2) {
+        std::vector<uint64_t> h;
+        uint8_t* first = nullptr;
+        for (size_t i = 1; i < w.size(); i++) {
+            int id = atoi(w[i].c_str());
+            uint8_t* obj = (uint8_t*)RawResolve(51, id);
+            if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[i];
+            if (!first) first = obj;
+            h.push_back(((uint64_t)(uint32_t)id << 32) | 51u);
+        }
+        void* theatre = nullptr;
+        if (!RawBytes(first + 0x290, (uint8_t*)&theatre, 8) || !theatre || !RawClassName((uint8_t*)theatre, cls) ||
+            strcmp(cls, "CTheatre") != 0) return "FAIL the first division has no theatre";
+        int r = RawCreateArmy(h.data(), (int)h.size(), theatre);
+        if (r == 0) return "FAIL the game refused to create the army";
+        if (r < 0) return r == -1 ? "ERROR crashed while creating the army" : "ERROR crashed while building the command";
+        int army = OrderIdOf(first);
+        int in = 0;
+        for (size_t i = 1; i < w.size(); i++) {
+            uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[i].c_str()));
+            if (obj && army && OrderIdOf(obj) == army) in++;
+        }
+        char b[96];
+        snprintf(b, sizeof b, "OK army %d with %d of %zu divisions", army, in, w.size() - 1);
+        return b;
+    }
+    if (w[0] == "leader" && w.size() == 3) {
+        void* army = RawResolve(53, atoi(w[1].c_str()));
+        void* leader = RawResolve(4713, atoi(w[2].c_str()));
+        if (!army) return "FAIL no army with id " + w[1];
+        if (!leader) return "FAIL no unit leader with id " + w[2];
+        int r = RawSetLeader(leader, army);
+        if (r == 1) return "OK leader " + w[2] + " commands army " + w[1];
+        if (r == 0) return "FAIL the game refused the leader";
+        return r == -1 ? "ERROR crashed while setting the leader" : "ERROR crashed while building the command";
+    }
+    return usage;
+}
+
 // bridge.move DIVISION_ID PROVINCE [b4 i5 b6 b7 b8 b9 b10]
 static std::string MoveCommand(const std::string& args) {
     auto w = Words(args);
@@ -2103,6 +2224,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd.rfind("bridge.object ", 0) == 0) return ObjectCommand(cmd.substr(14));
     if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
     if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
+    if (cmd.rfind("bridge.army ", 0) == 0) return ArmyCommand(cmd.substr(12));
     if (cmd.rfind("bridge.watch ", 0) == 0) return WatchCommand(cmd.substr(13));
     if (cmd == "bridge.protect" || cmd.rfind("bridge.protect ", 0) == 0) return ProtectCommand(cmd.substr(14));
     if (cmd == "bridge.snap" || cmd.rfind("bridge.snap ", 0) == 0) return SnapCommand(cmd.substr(11));
