@@ -2007,8 +2007,12 @@ static std::string WatchCommand(const std::string& args) {
 // Their constructors are found by a prologue pattern plus a lea of the class's own vtable within it.
 using OrderGroupCtorFn = void*(__fastcall*)(void* cmd, void* units, void* theatre, void* extra);
 using SetLeaderCtorFn = void*(__fastcall*)(void* cmd, void* leader, void* army, char flag);
+// CAssignToArmyGroupCommand(cmd, vector<army*>* armies, army group*, int index): Execute puts the armies into the
+// group (index -1: at the end).
+using AssignGroupCtorFn = void*(__fastcall*)(void* cmd, void* armies, void* group, int index);
 static OrderGroupCtorFn g_orderGroupCtor;
 static SetLeaderCtorFn g_setLeaderCtor;
+static AssignGroupCtorFn g_assignGroupCtor;
 
 static uint8_t* FindCtorFor(const char* cls, const char* pat) {
     void** vt = nullptr;
@@ -2029,8 +2033,14 @@ static bool FindArmyCtors() {
         g_setLeaderCtor = (SetLeaderCtorFn)FindCtorFor("CSetArmyLeaderCommand",
             "48 89 5C 24 10 48 89 74 24 18 48 89 4C 24 08 57 48 83 EC 30 41 0F B6 F1 49 8B F8 48 8B D9 C6 41 08 00 "
             "C7 41 0C FF FF FF FF 33 C0 48 89 41 10 33 C9 48 89 4B 10 C7 43 18 FF FF 00 00 48 89 4B 1C 48 8D 05");
-    Log("army: COrderGroupCommand ctor %p, CSetArmyLeaderCommand ctor %p", g_orderGroupCtor, g_setLeaderCtor);
-    return g_orderGroupCtor && g_setLeaderCtor;
+    if (!g_assignGroupCtor)
+        g_assignGroupCtor = (AssignGroupCtorFn)FindCtorFor("CAssignToArmyGroupCommand",
+            "48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40 0F 29 74 24 30 41 8B F9 "
+            "49 8B D8 4C 8B E2 4C 8B F1 C6 41 08 00 C7 41 0C FF FF FF FF 45 33 ED 4C 89 69 10 C7 41 18 FF FF 00 00 "
+            "4C 89 69 1C 48 8D 05");
+    Log("army: COrderGroupCommand ctor %p, CSetArmyLeaderCommand ctor %p, CAssignToArmyGroupCommand ctor %p",
+        g_orderGroupCtor, g_setLeaderCtor, g_assignGroupCtor);
+    return g_orderGroupCtor && g_setLeaderCtor && g_assignGroupCtor;
 }
 
 // Check and execute a command built in CMD, then destroy it: 1 executed, 0 refused by the game's check, -1 crashed.
@@ -2063,6 +2073,13 @@ static int RawCreateArmy(uint64_t* handles, int n, void* theatre) {
     struct { uint64_t* data; int cap; int count; } vec = { handles, n, n };
     alignas(16) uint8_t cmd[0x100] = {};
     __try { g_orderGroupCtor(cmd, &vec, theatre, nullptr); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    return RunBuilt(cmd);
+}
+
+static int RawAssignToGroup(void** armies, int n, void* group) {
+    struct { void** data; int cap; int count; } vec = { armies, n, n };
+    alignas(16) uint8_t cmd[0x100] = {};
+    __try { g_assignGroupCtor(cmd, &vec, group, -1); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
     return RunBuilt(cmd);
 }
 
@@ -2109,10 +2126,11 @@ static uint8_t* PointerToClass(uint8_t* obj, size_t len, const char* clsWanted) 
     return nullptr;
 }
 
-// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID..
+// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID.. | assign GROUP_ID ARMY_ID..
 static std::string ArmyCommand(const std::string& args) {
     auto w = Words(args);
-    const char* usage = "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID..";
+    const char* usage =
+        "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID.. | assign GROUP_ID ARMY_ID..";
     if (w.empty()) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
     if (!FindArmyCtors()) return "FAIL army command constructors not found";
@@ -2164,6 +2182,28 @@ static std::string ArmyCommand(const std::string& args) {
         if (RawBytes(first + 0x1b8, (uint8_t*)&group, 8) && group) RawBytes(group + 0xc, (uint8_t*)&gid, 4);
         char b[64];
         snprintf(b, sizeof b, "OK army group %d", gid);
+        return b;
+    }
+    if (w[0] == "assign" && w.size() >= 3) {
+        void* group = RawResolve(53, atoi(w[1].c_str()));
+        if (!group || !RawClassName((uint8_t*)group, cls) || strcmp(cls, "CArmyGroup") != 0)
+            return "FAIL no army group with id " + w[1];
+        std::vector<void*> armies;
+        for (size_t i = 2; i < w.size(); i++) {
+            void* a = RawResolve(53, atoi(w[i].c_str()));
+            if (!a) return "FAIL no army with id " + w[i];
+            armies.push_back(a);
+        }
+        int r = RawAssignToGroup(armies.data(), (int)armies.size(), group);
+        if (r == 0) return "FAIL the game refused the assignment";
+        if (r < 0) return "ERROR crashed while assigning";
+        int in = 0;
+        for (void* a : armies) {
+            uint8_t* parent = nullptr;
+            if (RawBytes((uint8_t*)a + 0x1b8, (uint8_t*)&parent, 8) && parent == group) in++;
+        }
+        char b[96];
+        snprintf(b, sizeof b, "OK %d of %zu armies in army group %s", in, armies.size(), w[1].c_str());
         return b;
     }
     if (w[0] == "leader" && w.size() == 3) {
