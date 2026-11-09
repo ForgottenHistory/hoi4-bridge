@@ -1326,13 +1326,15 @@ static bool OwnerFromLists(const std::string& name, const uint8_t* bytes, char t
     return false;
 }
 
-// The owner of a command under a rule, including auto rules (a handle in the command, else one in its lists).
+// The owner of a command under a rule, including auto rules (a handle in its lists, else one in the command).
+// Lists first: the raw bytes read past a small command into stale heap memory, where an old handle of another
+// country can come before the command's own (a CRemoveFromArmyGroupCommand of German armies read as French).
 static bool BlockOwner(void* self, const BlockRule& r, char tag[8], const std::string& name) {
     if (r.handleOff != -2) return RawOwner(self, r, tag);
     uint8_t b[kRecBytes];
     int via;
     if (!RawBytes(self, b, sizeof b)) return false;
-    return RecOwnerFromHandles(b, tag, &via) || OwnerFromLists(name, b, tag);
+    return OwnerFromLists(name, b, tag) || RecOwnerFromHandles(b, tag, &via);
 }
 
 static void RecordCommand(const std::string& name, void* self) {
