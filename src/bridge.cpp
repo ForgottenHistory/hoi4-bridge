@@ -1163,6 +1163,21 @@ static void* RawResolve(int type, int id) {
     __try { return g_resolve(h); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 
+// A division by id, and its handle type. Divisions from the game's setup are type 51; divisions made later in a game
+// loaded from a save can carry type 4713 (the unit leaders' type: verified 1941 save, 209 of Germany's 248). Type 51
+// first; a 4713 object only if it is a CArmy (a leader shares the type). Null if neither. SEH only.
+static uint8_t* RawDivision(int id, int* type = nullptr) {
+    char cls[96];
+    for (int t : { 51, 4713 }) {
+        uint8_t* obj = (uint8_t*)RawResolve(t, id);
+        if (obj && RawClassName(obj, cls) && strcmp(cls, "CArmy") == 0) {
+            if (type) *type = t;
+            return obj;
+        }
+    }
+    return nullptr;
+}
+
 // " +0x28=ITA +0x30=GER" for the 4-byte fields of p[from, to) that read as country ids.
 static std::string TagFields(const uint8_t* p, size_t from, size_t to) {
     std::string out;
@@ -1896,7 +1911,7 @@ static bool Protected(uint8_t* unit, void* ret) {
     if (!g_protOn || t_bridgeIssued) return false;
     int h[2] = { 0, 0 };
     RawBytes(unit + 0x18, (uint8_t*)h, 8);
-    if (h[0] != 51) return false;
+    if (h[0] != 51 && h[0] != 4713) return false;
     AcquireSRWLockExclusive(&g_protLock);
     bool mine = g_protIds.count(h[1]) > 0;
     if (mine) g_protCallers[(uintptr_t)((uint8_t*)ret - g_base)]++;
@@ -2021,7 +2036,7 @@ static std::string WatchCommand(const std::string& args) {
     if (w.size() == 1 && w[0] == "off") addr = 0;
     else if (w.size() == 3 && w[0] == "div") {
         EnsureCommandsPatched();
-        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[1].c_str()));
+        uint8_t* obj = RawDivision(atoi(w[1].c_str()));
         if (!obj) return "FAIL no division " + w[1];
         addr = (uintptr_t)(obj - 0x10 + strtol(w[2].c_str(), nullptr, 16));   // offset into the full object
     } else if (w.size() == 1) addr = (uintptr_t)strtoull(w[0].c_str(), nullptr, 16);
@@ -2230,11 +2245,11 @@ static uint8_t* NewHandBuilt(const char* cls) {
 }
 
 static bool DivisionHandles(const std::vector<std::string>& ids, std::vector<uint64_t>& out, std::string& bad) {
-    char cls[96];
     for (auto& s : ids) {
-        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(s.c_str()));
-        if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) { bad = s; return false; }
-        out.push_back(((uint64_t)(uint32_t)atoi(s.c_str()) << 32) | 51u);
+        int t = 51;
+        uint8_t* obj = RawDivision(atoi(s.c_str()), &t);
+        if (!obj) { bad = s; return false; }
+        out.push_back(((uint64_t)(uint32_t)atoi(s.c_str()) << 32) | (uint32_t)t);
     }
     return true;
 }
@@ -2382,11 +2397,11 @@ static std::string ArmyCommand(const std::string& args) {
         std::vector<uint64_t> h;
         uint8_t* first = nullptr;
         for (size_t i = 1; i < w.size(); i++) {
-            int id = atoi(w[i].c_str());
-            uint8_t* obj = (uint8_t*)RawResolve(51, id);
-            if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[i];
+            int id = atoi(w[i].c_str()), t = 51;
+            uint8_t* obj = RawDivision(id, &t);
+            if (!obj) return "FAIL no division with id " + w[i];
             if (!first) first = obj;
-            h.push_back(((uint64_t)(uint32_t)id << 32) | 51u);
+            h.push_back(((uint64_t)(uint32_t)id << 32) | (uint32_t)t);
         }
         void* theatre = nullptr;
         if (!RawBytes(first + 0x290, (uint8_t*)&theatre, 8) || !theatre || !RawClassName((uint8_t*)theatre, cls) ||
@@ -2397,7 +2412,7 @@ static std::string ArmyCommand(const std::string& args) {
         int army = OrderIdOf(first);
         int in = 0;
         for (size_t i = 1; i < w.size(); i++) {
-            uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[i].c_str()));
+            uint8_t* obj = RawDivision(atoi(w[i].c_str()));
             if (obj && army && OrderIdOf(obj) == army) in++;
         }
         char b[96];
@@ -2433,17 +2448,17 @@ static std::string ArmyCommand(const std::string& args) {
         if (!army) return "FAIL no army with id " + w[1];
         std::vector<uint64_t> h;
         for (size_t i = 2; i < w.size(); i++) {
-            int id = atoi(w[i].c_str());
-            uint8_t* obj = (uint8_t*)RawResolve(51, id);
-            if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[i];
-            h.push_back(((uint64_t)(uint32_t)id << 32) | 51u);
+            int id = atoi(w[i].c_str()), t = 51;
+            uint8_t* obj = RawDivision(id, &t);
+            if (!obj) return "FAIL no division with id " + w[i];
+            h.push_back(((uint64_t)(uint32_t)id << 32) | (uint32_t)t);
         }
         int r = RawAssignDivisions(h.data(), (int)h.size(), army);
         if (r == 0) return "FAIL the game refused the assignment";
         if (r < 0) return "ERROR crashed while assigning";
         int in = 0;
         for (size_t i = 2; i < w.size(); i++) {
-            uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[i].c_str()));
+            uint8_t* obj = RawDivision(atoi(w[i].c_str()));
             if (obj && OrderIdOf(obj) == armyId) in++;
         }
         char b[96];
@@ -2502,11 +2517,10 @@ static std::string StopCommand(const std::string& args) {
     if (w.empty()) return "FAIL usage: bridge.stop DIVISION_ID..";
     if (!g_resolve) return "FAIL no handle resolver";
     if (!EnsureProtectHook() || !o_cancelMove) return "FAIL CancelMovement not found";
-    char cls[96];
     int n = 0;
     for (auto& s : w) {
-        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(s.c_str()));
-        if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + s;
+        uint8_t* obj = RawDivision(atoi(s.c_str()));
+        if (!obj) return "FAIL no division with id " + s;
         n += RawCancelMove(obj - 0x10);
     }
     char b[64];
@@ -2523,9 +2537,8 @@ static std::string MoveCommand(const std::string& args) {
     int id = atoi(w[0].c_str()), prov = atoi(w[1].c_str());
     char f[7] = { 1, 2, 1, 0, 0, 0, 0 };
     if (w.size() == 9) for (int i = 0; i < 7; i++) f[i] = (char)atoi(w[2 + i].c_str());
-    uint8_t* obj = (uint8_t*)RawResolve(51, id);
-    char cls[96];
-    if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[0];
+    uint8_t* obj = RawDivision(id);
+    if (!obj) return "FAIL no division with id " + w[0];
     char tag[8] = "?";
     int owner = 0;
     if (RawBytes(obj + 0x1c8, (uint8_t*)&owner, 4)) RawTagOf(owner, tag);
@@ -2586,9 +2599,8 @@ static std::string RailCommand(const std::string& args) {
     int id = atoi(w[0].c_str()), prov = atoi(w[1].c_str());
     char b = w.size() == 4 ? (char)atoi(w[2].c_str()) : 1;
     int i = w.size() == 4 ? atoi(w[3].c_str()) : 2;
-    uint8_t* obj = (uint8_t*)RawResolve(51, id);
-    char cls[96];
-    if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[0];
+    uint8_t* obj = RawDivision(id);
+    if (!obj) return "FAIL no division with id " + w[0];
     int r = RawRail(obj - 0x10, prov, b, i);
     if (r == 1) return "OK division " + w[0] + " redeploying by rail to province " + w[1];
     if (r == 0) return "FAIL the game refused the redeployment (no rail route, at the front, or not allowed)";
