@@ -2163,8 +2163,8 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
 // theatre; +0x20 its border provinces (unordered), +0x58 its CFrontSections: connected stretches, each with our
 // provinces in order at +0x30 and (ours, theirs) pairs at +0x48). START..END run along the sections in turn.
 //   COrderNewRootCommand (front line): +0x28 army handle, +0x30 division handles {data, cap, count} + allocator,
-//     +0x48 CFront handle, +0x50 2, +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
-//     percent (0..100000), +0x70 the CFront's section count + 1, +0x74 1, +0x80 an empty list.
+//     +0x48 CFront handle, +0x50 2 (s=N), +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
+//     percent (0..100000), +0x70 the CFront's section count + 1 (k=N), +0x74 1, +0x80 an empty list.
 //   COrderNewFrontCommand (offensive line): +0x28 / +0x30 army handle, +0x38 division handles, +0x50 province ids
 //     of the line's points (the last one the target), +0x68 the id of the front line it belongs to, +0x70 1.
 //   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
@@ -2236,7 +2236,7 @@ static std::string RunReply(int r, const char* what) {
 // bridge.plan front ARMY FRONT START END DIV.. | arrow ARMY PROVINCE[,PROVINCE..] DIV.. | execute ARMY [0|1] | delete ARMY | cohesion ARMY 0-3
 static std::string PlanCommand(const std::string& args) {
     auto w = Words(args);
-    const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END DIVISION_ID.. | "
+    const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END [s=N] [k=N] DIVISION_ID.. | "
                         "arrow ARMY_ID [#LINE_ID] PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | "
                         "delete ARMY_ID LINE_ID.. | "
                         "cohesion ARMY_ID 0-3";
@@ -2255,17 +2255,24 @@ static std::string PlanCommand(const std::string& args) {
         int sections = 0;
         RawBytes(front + 0x30, (uint8_t*)&alloc, 8);
         RawBytes(front + 0x64, (uint8_t*)&sections, 4);
+        int f50 = 2, f70 = sections + 1;   // optional "s=N" (+0x50, 2 in every recorded line) and "k=N" (+0x70)
+        size_t at = 5;
+        while (at < w.size() && w[at].size() > 2 && w[at][1] == '=') {
+            if (w[at][0] == 's') f50 = atoi(w[at].c_str() + 2);
+            if (w[at][0] == 'k') f70 = atoi(w[at].c_str() + 2);
+            at++;
+        }
         std::vector<uint64_t> h;
-        if (!DivisionHandles(std::vector<std::string>(w.begin() + 5, w.end()), h, bad)) return "FAIL no division with id " + bad;
+        if (!DivisionHandles(std::vector<std::string>(w.begin() + at, w.end()), h, bad)) return "FAIL no division with id " + bad;
         uint8_t* cmd = NewHandBuilt("COrderNewRootCommand");
         if (!cmd) return "FAIL COrderNewRootCommand vtable not found";
         *(uint64_t*)(cmd + 0x28) = army;
         PutVec(cmd, 0x30, Persist(h), (int)h.size(), alloc);
         *(uint64_t*)(cmd + 0x48) = ((uint64_t)(uint32_t)frontId << 32) | 66u;
-        *(int*)(cmd + 0x50) = 2;
+        *(int*)(cmd + 0x50) = f50;
         *(int64_t*)(cmd + 0x58) = _atoi64(w[3].c_str());
         *(int64_t*)(cmd + 0x60) = _atoi64(w[4].c_str());
-        *(int*)(cmd + 0x70) = sections + 1;
+        *(int*)(cmd + 0x70) = f70;
         *(int*)(cmd + 0x74) = 1;
         PutVec(cmd, 0x80, nullptr, 0, alloc);
         return RunReply(RunHandBuilt(cmd), "front line");
