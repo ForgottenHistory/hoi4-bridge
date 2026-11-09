@@ -2072,10 +2072,47 @@ static int RawSetLeader(void* leader, void* army) {
     return RunBuilt(cmd);
 }
 
-// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID
+// CArmyGroupCommand, built by hand (its constructor takes more than we need): +0x28 theatre handle, +0x30/+0x3c
+// handles of existing armies, +0x48/+0x54 division lists for new armies (none here), +0x60.. an optional front
+// (none). Execute makes an army group of the armies. Not destroyed afterwards: its lists point at our memory.
+static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
+    void** vt = nullptr;
+    for (auto& kv : g_cmdName) if (kv.second == "CArmyGroupCommand") vt = (void**)kv.first;
+    if (!vt) return -3;
+    alignas(16) uint8_t cmd[0x100] = {};
+    *(void***)cmd = vt;
+    *(int*)(cmd + 0x0c) = -1;
+    *(int*)(cmd + 0x18) = 0xffff;
+    *(uint64_t*)(cmd + 0x28) = theatreHandle;
+    *(uint64_t**)(cmd + 0x30) = armies;
+    *(int*)(cmd + 0x38) = n;
+    *(int*)(cmd + 0x3c) = n;
+    __try {
+        if (!((ValidFn)vt[9])(cmd, nullptr)) return 0;
+        t_bridgeIssued = true;
+        ((CmdExecFn)vt[10])(cmd, nullptr, nullptr, nullptr);
+        t_bridgeIssued = false;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return -1;
+    }
+}
+
+// The first pointer in OBJ[0, len) to an object of class CLS, or null.
+static uint8_t* PointerToClass(uint8_t* obj, size_t len, const char* clsWanted) {
+    char cls[96];
+    for (size_t o = 0; o + 8 <= len; o += 8) {
+        uint8_t* p = nullptr;
+        if (RawBytes(obj + o, (uint8_t*)&p, 8) && p && RawClassName(p, cls) && strcmp(cls, clsWanted) == 0) return p;
+    }
+    return nullptr;
+}
+
+// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID..
 static std::string ArmyCommand(const std::string& args) {
     auto w = Words(args);
-    const char* usage = "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID";
+    const char* usage = "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID..";
     if (w.empty()) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
     if (!FindArmyCtors()) return "FAIL army command constructors not found";
@@ -2104,6 +2141,29 @@ static std::string ArmyCommand(const std::string& args) {
         }
         char b[96];
         snprintf(b, sizeof b, "OK army %d with %d of %zu divisions", army, in, w.size() - 1);
+        return b;
+    }
+    if (w[0] == "group" && w.size() >= 2) {
+        std::vector<uint64_t> h;
+        uint8_t* first = nullptr;
+        for (size_t i = 1; i < w.size(); i++) {
+            int id = atoi(w[i].c_str());
+            uint8_t* obj = (uint8_t*)RawResolve(53, id);
+            if (!obj) return "FAIL no army with id " + w[i];
+            if (!first) first = obj;
+            h.push_back(((uint64_t)(uint32_t)id << 32) | 53u);
+        }
+        uint8_t* theatre = PointerToClass(first, 0x400, "CTheatre");
+        uint64_t th = 0;
+        if (!theatre || !RawBytes(theatre + 8, (uint8_t*)&th, 8)) return "FAIL the first army has no theatre";
+        int r = RawCreateGroup(th, h.data(), (int)h.size());
+        if (r == 0) return "FAIL the game refused to create the army group";
+        if (r < 0) return r == -3 ? "FAIL CArmyGroupCommand vtable not found" : "ERROR crashed while creating the army group";
+        uint8_t* group = nullptr;
+        int gid = 0;
+        if (RawBytes(first + 0x1b8, (uint8_t*)&group, 8) && group) RawBytes(group + 0xc, (uint8_t*)&gid, 4);
+        char b[64];
+        snprintf(b, sizeof b, "OK army group %d", gid);
         return b;
     }
     if (w[0] == "leader" && w.size() == 3) {
