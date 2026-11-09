@@ -2535,6 +2535,66 @@ static std::string MoveCommand(const std::string& args) {
     return r == -1 ? "ERROR crashed while executing the move" : "ERROR crashed while building the move";
 }
 
+// ---- bridge.rail: strategic redeployment (by rail) of a division to a province, as the game's own code builds it.
+// CStrategicRedeploymentCommand(cmd, CArmy* unit, int province, bool, int): the game AI passes (1, 2). Its Execute
+// is CMoveCommand's; the unit's handle is copied from unit +0x18 to +0x38, the province to +0x40.
+using RailCtorFn = void*(__fastcall*)(void* cmd, void* unit, int province, char b, int i);
+static RailCtorFn g_railCtor;
+
+static bool FindRailCtor() {
+    if (g_railCtor) return true;
+    void** vt = nullptr;
+    for (auto& kv : g_cmdName) if (kv.second == "CStrategicRedeploymentCommand") vt = (void**)kv.first;
+    if (!vt) return false;
+    const char* pat = "48 89 4C 24 08 53 48 83 EC 30 48 8B D9 C6 41 08 00 C7 41 0C FF FF FF FF 33 C0 48 89 41 10 "
+                      "33 C9 48 89 4B 10 C7 43 18 FF FF 00 00 48 89 4B 1C 48 8D 05";
+    for (uint8_t* c = g_textStart; (c = FindPattern(c, g_textEnd, pat)) != nullptr; c++)
+        if (Rel32(c + 0x2f, 3, 7) == (uint8_t*)vt) { g_railCtor = (RailCtorFn)c; break; }
+    Log("rail: CStrategicRedeploymentCommand vtable %p ctor %p", vt, g_railCtor);
+    return g_railCtor != nullptr;
+}
+
+// 1 executed, 0 the game's check refused it, -1/-2 crashed. SEH only.
+static int RawRail(void* unit, int province, char b, int i) {
+    alignas(16) uint8_t cmd[0x100] = {};
+    bool built = false;
+    __try {
+        g_railCtor(cmd, unit, province, b, i);
+        built = true;
+        void** vt = *(void***)cmd;
+        int r = 0;
+        if (((ValidFn)vt[9])(cmd, nullptr)) {
+            t_bridgeIssued = true;
+            ((CmdExecFn)vt[10])(cmd, nullptr, nullptr, nullptr);
+            t_bridgeIssued = false;
+            r = 1;
+        }
+        ((DtorFn)vt[0])(cmd, 0);
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return built ? -1 : -2;
+    }
+}
+
+// bridge.rail DIVISION_ID PROVINCE [b i]
+static std::string RailCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() != 2 && w.size() != 4) return "FAIL usage: bridge.rail DIVISION_ID PROVINCE [b i]";
+    if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
+    if (!FindRailCtor()) return "FAIL CStrategicRedeploymentCommand constructor not found";
+    int id = atoi(w[0].c_str()), prov = atoi(w[1].c_str());
+    char b = w.size() == 4 ? (char)atoi(w[2].c_str()) : 1;
+    int i = w.size() == 4 ? atoi(w[3].c_str()) : 2;
+    uint8_t* obj = (uint8_t*)RawResolve(51, id);
+    char cls[96];
+    if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[0];
+    int r = RawRail(obj - 0x10, prov, b, i);
+    if (r == 1) return "OK division " + w[0] + " redeploying by rail to province " + w[1];
+    if (r == 0) return "FAIL the game refused the redeployment (no rail route, at the front, or not allowed)";
+    return r == -1 ? "ERROR crashed while executing the redeployment" : "ERROR crashed while building the redeployment";
+}
+
 static void __fastcall hk_execCmd(void* cmd, int depth) {
     int prev = t_cmdDepth;
     t_cmdDepth = depth;
@@ -2619,6 +2679,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd.rfind("bridge.object ", 0) == 0) return ObjectCommand(cmd.substr(14));
     if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
     if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
+    if (cmd == "bridge.rail" || cmd.rfind("bridge.rail ", 0) == 0) return RailCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd.rfind("bridge.army ", 0) == 0) return ArmyCommand(cmd.substr(12));
     if (cmd == "bridge.plan" || cmd.rfind("bridge.plan ", 0) == 0) return PlanCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd == "bridge.stop" || cmd.rfind("bridge.stop ", 0) == 0) return StopCommand(cmd.size() > 12 ? cmd.substr(12) : "");
