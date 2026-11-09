@@ -2166,9 +2166,11 @@ static int RawCreateGroup(uint64_t theatreHandle, uint64_t* armies, int n) {
 //     +0x48 CFront handle, +0x50 2, +0x58 / +0x60 start / end along the CFront's province list in thousandths of a
 //     percent (0..100000), +0x70 the CFront's section count + 1, +0x74 1, +0x80 an empty list.
 //   COrderNewFrontCommand (offensive line): +0x28 / +0x30 army handle, +0x38 division handles, +0x50 province ids
-//     of the line's points (the last one the target), +0x68 an id the game's check wants (found by trying), +0x70 1.
+//     of the line's points (the last one the target), +0x68 the id of the front line it belongs to, +0x70 1.
 //   COrderExecuteCommand: +0x28 army handle, +0x34 1 (execute).
-//   COrderDeleteCommand: +0x28 army handle (deletes the army's plan).
+//   COrderDeleteCommand: +0x28 army handle, +0x30 id of the line to delete.
+// An army's lines: COrdersGroup +0x98 lists its COrderInstances (id at +0x244, the line's (ours, theirs) provinces
+// at +0x88).
 //   CSetOrderGroupCohesionTypeCommand: +0x28 army handle, +0x30 0 flexible, 1 balanced, 2 rigid, 3 immobile (the
 //     army keeps its plan and builds planning, but the game doesn't move its divisions).
 // Built by hand, checked, executed and not destroyed (their lists point at memory we never free).
@@ -2235,7 +2237,8 @@ static std::string RunReply(int r, const char* what) {
 static std::string PlanCommand(const std::string& args) {
     auto w = Words(args);
     const char* usage = "FAIL usage: bridge.plan front ARMY_ID FRONT_ID START END DIVISION_ID.. | "
-                        "arrow ARMY_ID PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | delete ARMY_ID | "
+                        "arrow ARMY_ID [#LINE_ID] PROVINCE[,PROVINCE..] DIVISION_ID.. | execute ARMY_ID [0|1] | "
+                        "delete ARMY_ID LINE_ID.. | "
                         "cohesion ARMY_ID 0-3";
     if (w.size() < 2) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
@@ -2268,6 +2271,9 @@ static std::string PlanCommand(const std::string& args) {
         return RunReply(RunHandBuilt(cmd), "front line");
     }
     if (w[0] == "arrow" && w.size() >= 4) {
+        int rootId = 0;   // the front line the offensive line belongs to: "#ID" before the provinces
+        if (w[2][0] == '#') { rootId = atoi(w[2].c_str() + 1); w.erase(w.begin() + 2); }
+        if (w.size() < 4) return usage;
         std::vector<int> pts;
         for (const char* c = w[2].c_str(); *c; ) {
             pts.push_back(atoi(c));
@@ -2288,6 +2294,10 @@ static std::string PlanCommand(const std::string& args) {
         *(uint8_t*)(cmd + 0x70) = 1;
         // +0x68 is an id the game checks (1 for a player's first offensive line, 5 for a later one): try them in
         // turn; a refused check changes nothing
+        if (rootId) {
+            *(int*)(cmd + 0x68) = rootId;
+            return RunReply(RunHandBuilt(cmd), "offensive line");
+        }
         int r = 0, id = 1;
         for (; id <= 256 && r == 0; id++) {
             *(int*)(cmd + 0x68) = id;
@@ -2305,11 +2315,18 @@ static std::string PlanCommand(const std::string& args) {
         *(int*)(cmd + 0x30) = atoi(w[2].c_str());
         return RunReply(RunHandBuilt(cmd), "cohesion");
     }
-    if (w[0] == "delete") {   // COrderDeleteCommand: +0x28 army handle; removes the army's plan, not the army
-        uint8_t* cmd = NewHandBuilt("COrderDeleteCommand");
-        if (!cmd) return "FAIL COrderDeleteCommand vtable not found";
-        *(uint64_t*)(cmd + 0x28) = army;
-        return RunReply(RunHandBuilt(cmd), "plan deletion");
+    if (w[0] == "delete" && w.size() >= 3) {   // COrderDeleteCommand: +0x28 army handle, +0x30 the line's id
+        int ok = 0;
+        for (size_t i = 2; i < w.size(); i++) {
+            uint8_t* cmd = NewHandBuilt("COrderDeleteCommand");
+            if (!cmd) return "FAIL COrderDeleteCommand vtable not found";
+            *(uint64_t*)(cmd + 0x28) = army;
+            *(int*)(cmd + 0x30) = atoi(w[i].c_str());
+            ok += RunHandBuilt(cmd) == 1;
+        }
+        char b[64];
+        snprintf(b, sizeof b, "OK deleted %d of %zu lines", ok, w.size() - 2);
+        return b;
     }
     if (w[0] == "execute") {
         uint8_t* cmd = NewHandBuilt("COrderExecuteCommand");
