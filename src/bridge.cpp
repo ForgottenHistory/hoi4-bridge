@@ -2037,9 +2037,13 @@ using SetLeaderCtorFn = void*(__fastcall*)(void* cmd, void* leader, void* army, 
 // CAssignToArmyGroupCommand(cmd, vector<army*>* armies, army group*, int index): Execute puts the armies into the
 // group (index -1: at the end).
 using AssignGroupCtorFn = void*(__fastcall*)(void* cmd, void* armies, void* group, int index);
+// COrderAssignCommand(cmd, vector<handle>* divisions, order*, int): Execute moves the divisions into the army
+// (or front). The army UI sends it with the int 0.
+using OrderAssignCtorFn = void*(__fastcall*)(void* cmd, void* units, void* order, int pos);
 static OrderGroupCtorFn g_orderGroupCtor;
 static SetLeaderCtorFn g_setLeaderCtor;
 static AssignGroupCtorFn g_assignGroupCtor;
+static OrderAssignCtorFn g_orderAssignCtor;
 
 static uint8_t* FindCtorFor(const char* cls, const char* pat) {
     void** vt = nullptr;
@@ -2065,9 +2069,13 @@ static bool FindArmyCtors() {
             "48 89 5C 24 18 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40 0F 29 74 24 30 41 8B F9 "
             "49 8B D8 4C 8B E2 4C 8B F1 C6 41 08 00 C7 41 0C FF FF FF FF 45 33 ED 4C 89 69 10 C7 41 18 FF FF 00 00 "
             "4C 89 69 1C 48 8D 05");
-    Log("army: COrderGroupCommand ctor %p, CSetArmyLeaderCommand ctor %p, CAssignToArmyGroupCommand ctor %p",
-        g_orderGroupCtor, g_setLeaderCtor, g_assignGroupCtor);
-    return g_orderGroupCtor && g_setLeaderCtor && g_assignGroupCtor;
+    if (!g_orderAssignCtor)
+        g_orderAssignCtor = (OrderAssignCtorFn)FindCtorFor("COrderAssignCommand",
+            "48 89 5C 24 10 48 89 4C 24 08 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 30 41 8B D9 4D 8B F8 4C 8B E2 "
+            "48 8B F1 C6 41 08 00 C7 41 0C FF FF FF FF 45 33 ED 4C 89 69 10 C7 41 18 FF FF 00 00 4C 89 69 1C 48 8D 05");
+    Log("army: COrderGroupCommand ctor %p, CSetArmyLeaderCommand ctor %p, CAssignToArmyGroupCommand ctor %p, "
+        "COrderAssignCommand ctor %p", g_orderGroupCtor, g_setLeaderCtor, g_assignGroupCtor, g_orderAssignCtor);
+    return g_orderGroupCtor && g_setLeaderCtor && g_assignGroupCtor && g_orderAssignCtor;
 }
 
 // Check and execute a command built in CMD, then destroy it: 1 executed, 0 refused by the game's check, -1 crashed.
@@ -2107,6 +2115,13 @@ static int RawAssignToGroup(void** armies, int n, void* group) {
     struct { void** data; int cap; int count; } vec = { armies, n, n };
     alignas(16) uint8_t cmd[0x100] = {};
     __try { g_assignGroupCtor(cmd, &vec, group, -1); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+    return RunBuilt(cmd);
+}
+
+static int RawAssignDivisions(uint64_t* handles, int n, void* army) {
+    struct { uint64_t* data; int cap; int count; } vec = { handles, n, n };
+    alignas(16) uint8_t cmd[0x100] = {};
+    __try { g_orderAssignCtor(cmd, &vec, army, 0); } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
     return RunBuilt(cmd);
 }
 
@@ -2153,11 +2168,13 @@ static uint8_t* PointerToClass(uint8_t* obj, size_t len, const char* clsWanted) 
     return nullptr;
 }
 
-// bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID.. | assign GROUP_ID ARMY_ID..
+// bridge.army create DIVISION_ID.. | add ARMY_ID DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID..
+//             | assign GROUP_ID ARMY_ID..
 static std::string ArmyCommand(const std::string& args) {
     auto w = Words(args);
     const char* usage =
-        "FAIL usage: bridge.army create DIVISION_ID.. | leader ARMY_ID LEADER_ID | group ARMY_ID.. | assign GROUP_ID ARMY_ID..";
+        "FAIL usage: bridge.army create DIVISION_ID.. | add ARMY_ID DIVISION_ID.. | leader ARMY_ID LEADER_ID | "
+        "group ARMY_ID.. | assign GROUP_ID ARMY_ID..";
     if (w.empty()) return usage;
     if (!EnsureCommandsPatched() || !g_resolve) return "FAIL no command vtables / handle resolver";
     if (!FindArmyCtors()) return "FAIL army command constructors not found";
@@ -2211,6 +2228,29 @@ static std::string ArmyCommand(const std::string& args) {
         snprintf(b, sizeof b, "OK army group %d", gid);
         return b;
     }
+    if (w[0] == "add" && w.size() >= 3) {
+        int armyId = atoi(w[1].c_str());
+        void* army = RawResolve(53, armyId);
+        if (!army) return "FAIL no army with id " + w[1];
+        std::vector<uint64_t> h;
+        for (size_t i = 2; i < w.size(); i++) {
+            int id = atoi(w[i].c_str());
+            uint8_t* obj = (uint8_t*)RawResolve(51, id);
+            if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + w[i];
+            h.push_back(((uint64_t)(uint32_t)id << 32) | 51u);
+        }
+        int r = RawAssignDivisions(h.data(), (int)h.size(), army);
+        if (r == 0) return "FAIL the game refused the assignment";
+        if (r < 0) return "ERROR crashed while assigning";
+        int in = 0;
+        for (size_t i = 2; i < w.size(); i++) {
+            uint8_t* obj = (uint8_t*)RawResolve(51, atoi(w[i].c_str()));
+            if (obj && OrderIdOf(obj) == armyId) in++;
+        }
+        char b[96];
+        snprintf(b, sizeof b, "OK %d of %zu divisions in army %d", in, w.size() - 2, armyId);
+        return b;
+    }
     if (w[0] == "assign" && w.size() >= 3) {
         void* group = RawResolve(53, atoi(w[1].c_str()));
         if (!group || !RawClassName((uint8_t*)group, cls) || strcmp(cls, "CArmyGroup") != 0)
@@ -2244,6 +2284,35 @@ static std::string ArmyCommand(const std::string& args) {
         return r == -1 ? "ERROR crashed while setting the leader" : "ERROR crashed while building the command";
     }
     return usage;
+}
+
+static bool EnsureProtectHook();
+
+static int RawCancelMove(uint8_t* unit) {   // 1 done, 0 crashed
+    t_bridgeIssued = true;
+    int ok = 1;
+    __try { o_cancelMove(unit, 0); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    t_bridgeIssued = false;
+    return ok;
+}
+
+// bridge.stop DIVISION_ID..: call off a division's movement or attack, with the game's own CancelMovement (as its
+// CCancelMovementCommand does). Protected divisions are allowed: the bridge itself is stopping them.
+static std::string StopCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.empty()) return "FAIL usage: bridge.stop DIVISION_ID..";
+    if (!g_resolve) return "FAIL no handle resolver";
+    if (!EnsureProtectHook() || !o_cancelMove) return "FAIL CancelMovement not found";
+    char cls[96];
+    int n = 0;
+    for (auto& s : w) {
+        uint8_t* obj = (uint8_t*)RawResolve(51, atoi(s.c_str()));
+        if (!obj || !RawClassName(obj, cls) || strcmp(cls, "CArmy") != 0) return "FAIL no division with id " + s;
+        n += RawCancelMove(obj - 0x10);
+    }
+    char b[64];
+    snprintf(b, sizeof b, "OK stopped %d of %zu divisions", n, w.size());
+    return b;
 }
 
 // bridge.move DIVISION_ID PROVINCE [b4 i5 b6 b7 b8 b9 b10]
@@ -2352,6 +2421,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
     if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
     if (cmd.rfind("bridge.army ", 0) == 0) return ArmyCommand(cmd.substr(12));
+    if (cmd == "bridge.stop" || cmd.rfind("bridge.stop ", 0) == 0) return StopCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd.rfind("bridge.watch ", 0) == 0) return WatchCommand(cmd.substr(13));
     if (cmd == "bridge.protect" || cmd.rfind("bridge.protect ", 0) == 0) return ProtectCommand(cmd.substr(14));
     if (cmd == "bridge.snap" || cmd.rfind("bridge.snap ", 0) == 0) return SnapCommand(cmd.substr(11));
