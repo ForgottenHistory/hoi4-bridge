@@ -1460,7 +1460,7 @@ static int PatchCommandVtables() {
         // (battle plan commands that run other commands' Execute directly); the vtable check below keeps CCommands only
         auto endsWith = [&](const char* s) { size_t n = strlen(s); return name.size() > n && name.compare(name.size() - n, n, s) == 0; };
         if (name == "CCommand") baseCol = p;
-        else if (endsWith("Command") || endsWith("Commands")) cols[p] = name;
+        else if (endsWith("Command") || endsWith("Commands") || name == "CPauseGame") cols[p] = name;  // bridge.pause
     }
     if (!baseCol) { Log("cmdlog: CCommand RTTI not found"); return -1; }
 
@@ -2694,7 +2694,9 @@ static bool FindPause() {
     if (g_pauseVt) return true;
     for (auto& kv : g_cmdName) if (kv.second == "CPauseGame") g_pauseVt = (void**)kv.first;
     if (!g_pauseVt) return false;
-    uint8_t* exec = (uint8_t*)g_pauseVt[10];
+    auto orig = g_cmdOrig.find(g_pauseVt);  // slot 10 itself is our hook by now
+    if (orig == g_cmdOrig.end()) return false;
+    uint8_t* exec = (uint8_t*)orig->second;
     for (int i = 0; i < 0x20 && !g_idlerSlot; i++)  // mov rcx, [rip+X]
         if (exec[i] == 0x48 && exec[i + 1] == 0x8B && exec[i + 2] == 0x0D) g_idlerSlot = (uint8_t**)Rel32(exec + i, 3, 7);
     Log("pause: CPauseGame vtable %p idler slot %p", g_pauseVt, g_idlerSlot);
@@ -2719,7 +2721,7 @@ static int RawPause(bool pause) {  // 1 sent, -1 crashed
     cmd[0x48] = pause;
     __try {
         t_bridgeIssued = true;
-        ((CmdExecFn)g_pauseVt[10])(cmd, nullptr, nullptr, nullptr);
+        ((CmdExecFn)g_pauseVt[10])(cmd, nullptr, nullptr, nullptr);  // through the hook: recorded like any command
         t_bridgeIssued = false;
         return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
