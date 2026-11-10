@@ -2683,6 +2683,62 @@ static std::string WarsCommand(const std::string& args) {
     return "FAIL usage: bridge.wars [on | off | allow [A:B ...] | attempts]";
 }
 
+// ---- bridge.pause: pause or resume the game, as the pause key does. CPauseGame (0x50 bytes): std::string who
+// paused at +0x28 (the game shows "Game paused by <who>"), bool pause +0x48, +0x49 a flag the key leaves 0. Its
+// Execute loads the game's CInGameIdler (a global: the first rip-relative load in Execute) and calls its slot
+// 0x298 (pause, &who); the idler's +0x6c1 is 1 while paused.
+static uint8_t** g_idlerSlot;
+static void** g_pauseVt;
+
+static bool FindPause() {
+    if (g_pauseVt) return true;
+    for (auto& kv : g_cmdName) if (kv.second == "CPauseGame") g_pauseVt = (void**)kv.first;
+    if (!g_pauseVt) return false;
+    uint8_t* exec = (uint8_t*)g_pauseVt[10];
+    for (int i = 0; i < 0x20 && !g_idlerSlot; i++)  // mov rcx, [rip+X]
+        if (exec[i] == 0x48 && exec[i + 1] == 0x8B && exec[i + 2] == 0x0D) g_idlerSlot = (uint8_t**)Rel32(exec + i, 3, 7);
+    Log("pause: CPauseGame vtable %p idler slot %p", g_pauseVt, g_idlerSlot);
+    return g_idlerSlot != nullptr;
+}
+
+static int RawPaused() {  // 1 paused, 0 running, -1 unknown
+    __try {
+        uint8_t* idler = *g_idlerSlot;
+        return idler ? idler[0x6c1] != 0 : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static int RawPause(bool pause) {  // 1 sent, -1 crashed
+    alignas(16) uint8_t cmd[0x50] = {};
+    *(void***)cmd = g_pauseVt;
+    *(int*)(cmd + 0xc) = -1;
+    *(int*)(cmd + 0x18) = 0xffff;
+    memcpy(cmd + 0x28, "bridge", 6);          // short string, stored inline
+    *(uint64_t*)(cmd + 0x38) = 6;             // size
+    *(uint64_t*)(cmd + 0x40) = 15;            // capacity: inline
+    cmd[0x48] = pause;
+    __try {
+        t_bridgeIssued = true;
+        ((CmdExecFn)g_pauseVt[10])(cmd, nullptr, nullptr, nullptr);
+        t_bridgeIssued = false;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_bridgeIssued = false;
+        return -1;
+    }
+}
+
+// bridge.pause [on | off]: no argument answers "paused" or "running"
+static std::string PauseCommand(const std::string& args) {
+    auto w = Words(args);
+    if (!EnsureCommandsPatched()) return "FAIL no command vtables";
+    if (!FindPause()) return "FAIL CPauseGame not found";
+    if (!w.empty() && w[0] != "on" && w[0] != "off") return "FAIL usage: bridge.pause [on | off]";
+    if (!w.empty() && RawPause(w[0] == "on") < 0) return "ERROR crashed while pausing";
+    int p = RawPaused();
+    return p < 0 ? "FAIL pause state unreadable" : p ? "OK paused" : "OK running";
+}
+
 static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd == "bridge.wars" || cmd.rfind("bridge.wars ", 0) == 0) return WarsCommand(cmd.substr(11));
     if (cmd == "bridge.cmdlog" || cmd.rfind("bridge.cmdlog ", 0) == 0) return CmdLogCommand(cmd.substr(13));
@@ -2694,6 +2750,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd == "bridge.rail" || cmd.rfind("bridge.rail ", 0) == 0) return RailCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd.rfind("bridge.army ", 0) == 0) return ArmyCommand(cmd.substr(12));
     if (cmd == "bridge.plan" || cmd.rfind("bridge.plan ", 0) == 0) return PlanCommand(cmd.size() > 12 ? cmd.substr(12) : "");
+    if (cmd == "bridge.pause" || cmd.rfind("bridge.pause ", 0) == 0) return PauseCommand(cmd.size() > 13 ? cmd.substr(13) : "");
     if (cmd == "bridge.stop" || cmd.rfind("bridge.stop ", 0) == 0) return StopCommand(cmd.size() > 12 ? cmd.substr(12) : "");
     if (cmd.rfind("bridge.watch ", 0) == 0) return WatchCommand(cmd.substr(13));
     if (cmd == "bridge.protect" || cmd.rfind("bridge.protect ", 0) == 0) return ProtectCommand(cmd.substr(14));
