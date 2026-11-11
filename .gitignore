@@ -6,3 +6,6 @@ __pycache__/
 re/bin/
 *.exe
 *.log
+# MinHook is downloaded by deps/fetch_minhook.ps1 (its LICENSE.txt stays in git)
+deps/minhook/include/
+deps/minhook/lib/

@@ -1,7 +1,7 @@
 # Usage: [HOI4_PROGRAM=hoi4_1.19.3.exe] decompile.py <rva-hex> [<rva-hex> ...]  -> prints Ghidra's C decompilation (read-only, project not modified)
 import os, sys, pyghidra
 # Ghidra and its project live in the RE workbench, outside this repo.
-WB = os.environ.get("HOI4_RE_WORKBENCH", r"C:\Users\Albin\hoi4-console-bridge")
+WB = os.environ.get("HOI4_RE_WORKBENCH", os.path.join(os.path.expanduser("~"), "hoi4-console-bridge"))
 pyghidra.start(install_dir=os.path.join(WB, "tools", "ghidra_12.1.4_PUBLIC"))
 from ghidra.base.project import GhidraProject
 from ghidra.app.decompiler import DecompInterface
