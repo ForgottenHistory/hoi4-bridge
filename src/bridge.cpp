@@ -289,6 +289,8 @@ static bool ScanData() {
 
 static bool InGameCode(void* p) { return (uint8_t*)p >= g_textStart && (uint8_t*)p < g_textEnd; }
 
+static void* g_writableSlot1;   // vtable slot 1 of a country: the save-writable base (set by RawCountryByTag)
+
 // SEH-only helpers (no C++ objects inside)
 static void* RawCountryByTag(const char* tag, char* err, size_t cap) {
     __try {
@@ -300,6 +302,7 @@ static void* RawCountryByTag(const char* tag, char* err, size_t cap) {
         if (id < 1) { strcpy_s(err, cap, "unknown country tag"); return nullptr; }
         void* country = g_countryById(&id);
         if (!country) { strcpy_s(err, cap, "country does not exist"); return nullptr; }
+        g_writableSlot1 = (*(void***)country)[1];
         return country;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         snprintf(err, cap, "exception %#lx looking up the country", GetExceptionCode());
@@ -331,20 +334,23 @@ static int DescribeException(EXCEPTION_POINTERS* ep) {
 
 static void AppendText(std::string* dst, const char* p, int n) { dst->append(p, (size_t)n); }
 
-// Writes the country through the game's own CMemoryFile (text mode) and copies the result into *dst.
-static int RawWriteCountry(void* country, std::string* dst, char* err, size_t cap) {
+// Writes an object through its own save writer (vtable slot 2) into the game's CMemoryFile (text mode) and copies
+// the result into *dst. DEPTH is the indentation the fields get. Slots 1 and 3 belong to the save-writable base every
+// such object shares (CCountry, CAirWing, CAirBase, ...): an object whose slot 1 isn't the country's isn't written.
+static int RawWriteObject(void* obj, int depth, std::string* dst, char* err, size_t cap) {
     alignas(16) uint8_t buffer[0x40] = {};     // CPdxArray<char>: data, capacity, size (+0xc), allocator (+0x10)
     alignas(16) uint8_t memfile[0x100] = {};   // CMemoryFile is 0x58 bytes
     alignas(16) uint8_t writer[0x40] = {};
     __try {
-        void** vt = *(void***)country;
+        void** vt = *(void***)obj;
         void* writeFn = vt[2];
-        if (!InGameCode(writeFn)) { strcpy_s(err, cap, "country object looks wrong (write slot outside game code)"); return 0; }
+        if (!InGameCode(writeFn)) { strcpy_s(err, cap, "object looks wrong (write slot outside game code)"); return 0; }
+        if (g_writableSlot1 && vt[1] != g_writableSlot1) { strcpy_s(err, cap, "object has no save writer"); return 0; }
         g_bufCtor(buffer);
         g_memFileCtor(memfile, buffer, 1, 1, 1);
         g_writerCtor(writer, memfile, 0);
-        *(int*)(writer + 8) = 2;                       // depth: fields of countries={ TAG={ ... } }
-        ((void(__fastcall*)(void*, void*))writeFn)(country, writer);
+        *(int*)(writer + 8) = depth;                   // 2: fields of countries={ TAG={ ... } }
+        ((void(__fastcall*)(void*, void*))writeFn)(obj, writer);
         char* data = *(char**)buffer;
         int size = *(int*)(buffer + 0xc);
         if (data && size > 0) AppendText(dst, data, size);
@@ -352,7 +358,7 @@ static int RawWriteCountry(void* country, std::string* dst, char* err, size_t ca
         if (data && alloc) ((void(__fastcall*)(void*, void*))(*(void***)alloc)[2])(alloc, data);
         return 1;
     } __except (DescribeException(GetExceptionInformation())) {
-        snprintf(err, cap, "exception %#lx (%s) while the game wrote the country", GetExceptionCode(),
+        snprintf(err, cap, "exception %#lx (%s) while the game wrote the object", GetExceptionCode(),
                  g_lastThrowType[0] ? g_lastThrowType : "no C++ type");
         char* data = *(char**)buffer;                  // keep what was written so far, for diagnosis
         int size = *(int*)(buffer + 0xc);
@@ -379,7 +385,7 @@ static std::string DumpCountry(std::string tag) {
     void* country = RawCountryByTag(tag.c_str(), err, sizeof err);
     if (!country) return std::string("FAIL ") + err;
     std::string buf; buf.reserve(256 * 1024);
-    int rc = RawWriteCountry(country, &buf, err, sizeof err);
+    int rc = RawWriteObject(country, 2, &buf, err, sizeof err);
     if (rc < 0) {
         std::string tail = buf.size() > 600 ? buf.substr(buf.size() - 600) : buf;
         for (auto& ch : tail) if (ch == '\n') ch = '|'; else if (ch == '\t') ch = ' ';
@@ -1642,6 +1648,34 @@ static std::string ObjectCommand(const std::string& args) {
     return "OK " + DescribeObject(obj) + at + " ptrs:" + ptrs;
 }
 
+// bridge.write TYPE ID [DEPTH]: the object a handle names as the game writes it into a save (its fields, indented by
+// DEPTH tabs, default 1), e.g. an air wing (69) with its mission or an air base (65) with its wings. Only objects with
+// the save writer a country has (see RawWriteObject); "bridge.country" must have run once (it finds that writer).
+static std::string WriteCommand(const std::string& args) {
+    auto w = Words(args);
+    if (w.size() != 2 && w.size() != 3) return "FAIL usage: bridge.write TYPE ID [DEPTH]";
+    if (!g_dataReady) return "ERROR country data support not active (see console_bridge.log)";
+    if (!g_writableSlot1) {
+        char e[64];
+        const char* t = RawPlayerTag();
+        RawCountryByTag(t ? t : "GER", e, sizeof e);
+        if (!g_writableSlot1) return "FAIL no country to find the save writer with";
+    }
+    EnsureCommandsPatched();
+    if (!g_resolve) return "FAIL no handle resolver";
+    void* obj = RawResolve((int)strtol(w[0].c_str(), nullptr, 0), (int)strtol(w[1].c_str(), nullptr, 0));
+    if (!obj) return "FAIL no such object";
+    int depth = w.size() == 3 ? (int)strtol(w[2].c_str(), nullptr, 0) : 1;
+    char err[256] = "";
+    std::string buf;
+    int rc = RawWriteObject(obj, depth, &buf, err, sizeof err);
+    if (rc < 0) return std::string("ERROR ") + err + " after " + std::to_string(buf.size()) + " chars";
+    if (rc == 0) return std::string("FAIL ") + err;
+    char cls[96] = "?";
+    RawClassName(obj, cls);
+    return std::string("OK ") + cls + "\n" + buf;
+}
+
 // bridge.mem ADDR LEN: LEN (<= 0x1000) bytes at ADDR (hex) as hex; "?" for an unreadable 16-byte line.
 static std::string MemCommand(const std::string& args) {
     auto w = Words(args);
@@ -2790,6 +2824,7 @@ static std::string HandleBridgeCommand(const std::string& cmd) {
     if (cmd == "bridge.cmdblock" || cmd.rfind("bridge.cmdblock ", 0) == 0) return CmdBlockCommand(cmd.substr(15));
     if (cmd == "bridge.cmdrec" || cmd.rfind("bridge.cmdrec ", 0) == 0) return CmdRecCommand(cmd.substr(13));
     if (cmd.rfind("bridge.object ", 0) == 0) return ObjectCommand(cmd.substr(14));
+    if (cmd.rfind("bridge.write ", 0) == 0) return WriteCommand(cmd.substr(13));
     if (cmd.rfind("bridge.mem ", 0) == 0) return MemCommand(cmd.substr(11));
     if (cmd.rfind("bridge.move ", 0) == 0) return MoveCommand(cmd.substr(12));
     if (cmd == "bridge.rail" || cmd.rfind("bridge.rail ", 0) == 0) return RailCommand(cmd.size() > 12 ? cmd.substr(12) : "");
