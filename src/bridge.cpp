@@ -11,6 +11,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <cstdio>
+#include <share.h>
 #include <cstdint>
 #include <cstdarg>
 #include <cstring>
@@ -1249,6 +1250,7 @@ static unsigned long long g_recSeq = 0, g_recStart = 0;
 //   list:  a vector, data pointer at +off, int count at +b, elements of c bytes -> "L+0x28=[51:3,51:9]"
 //          (each element as its 4-byte ints joined by ':'; at most 64 elements)
 //   deref: an object pointer at +off, the int at +b of it -> "D+0x40=CProvince.0xa4=6325"
+//   field: the int at +off of the command itself, also past the recorded bytes -> "F+0xe8=1"
 // The column also names the class of every pointer in the command that leads to an object with RTTI ("P+0x40=CX").
 struct RecRule { char kind; int off, b, c; };
 static std::map<std::string, std::vector<RecRule>> g_recRules = {
@@ -1262,7 +1264,7 @@ static std::map<std::string, std::vector<RecRule>> g_recRules = {
     { "CCancelMovementCommand",      { { 'L', 0x28, 0x34, 8 } } },   // divisions whose movement is cancelled
 };
 
-static std::string RecExtra(const uint8_t* bytes, const std::vector<RecRule>* rules) {
+static std::string RecExtra(const void* self, const uint8_t* bytes, const std::vector<RecRule>* rules) {
     std::string out;
     char b[160], cls[96];
     for (size_t o = 0x20; o + 8 <= kRecBytes; o += 8) {
@@ -1271,6 +1273,11 @@ static std::string RecExtra(const uint8_t* bytes, const std::vector<RecRule>* ru
         if (RawClassName((void*)p, cls)) { snprintf(b, sizeof b, " P+%#zx=%s", o, cls); out += b; }
     }
     if (rules) for (auto& r : *rules) {
+        if (r.kind == 'F') {
+            int v;
+            if (RawBytes((const uint8_t*)self + r.off, (uint8_t*)&v, 4)) { snprintf(b, sizeof b, " F+%#x=%d", r.off, v); out += b; }
+            continue;
+        }
         uint8_t* p = *(uint8_t* const*)(bytes + r.off);
         if (r.kind == 'D') {
             int v;
@@ -1361,7 +1368,7 @@ static void RecordCommand(const std::string& name, void* self, bool dropped) {
     AcquireSRWLockShared(&g_recLock);
     bool skip = g_recSkip.count(name) > 0;
     auto rr = g_recRules.find(name);
-    std::string extra = skip ? "" : RecExtra(bytes, rr == g_recRules.end() ? nullptr : &rr->second);
+    std::string extra = skip ? "" : RecExtra(self, bytes, rr == g_recRules.end() ? nullptr : &rr->second);
     if (t_bridgeIssued) extra = (extra == "-" ? "" : extra + " ") + "SRC=bridge";
     if (dropped) extra = (extra == "-" ? "" : extra + " ") + "DROPPED";
     if (t_execDepth > 0) extra = (extra == "-" ? "" : extra + " ") + "DEPTH=" + std::to_string(t_execDepth + 1);
@@ -1739,7 +1746,8 @@ static std::string SnapCommand(const std::string& args) {
     return "OK " + std::to_string(found) + " objects (ids to " + std::to_string(last) + ")";
 }
 
-// bridge.cmdrec [on [PATH] | off | mark TEXT | skip CLASS.. | unskip CLASS.. | owner TYPE HEXOFF[.HEXOFF..]]
+// bridge.cmdrec [on [PATH] | off | mark TEXT | skip CLASS.. | unskip CLASS.. | owner TYPE HEXOFF[.HEXOFF..] |
+//                list CLASS PTR COUNT STRIDE | deref CLASS PTR FIELD | field CLASS OFF | rules CLASS off]
 static std::string CmdRecCommand(const std::string& args) {
     auto w = Words(args);
     std::string a = w.empty() ? "" : w[0];
@@ -1755,7 +1763,7 @@ static std::string CmdRecCommand(const std::string& args) {
         AcquireSRWLockExclusive(&g_recLock);
         if (g_recFile) fclose(g_recFile);
         g_recFile = nullptr;
-        fopen_s(&g_recFile, path.c_str(), "w");
+        g_recFile = _fsopen(path.c_str(), "w", _SH_DENYWR);   // others may read it while it is written
         if (g_recFile) {
             setvbuf(g_recFile, nullptr, _IOFBF, 1 << 20);
             fprintf(g_recFile, "#seq\tms\tclass\towner\tvia\tmode\thandles\thex%#zx\textra\n", kRecBytes);
@@ -1793,9 +1801,17 @@ static std::string CmdRecCommand(const std::string& args) {
         ReleaseSRWLockExclusive(&g_recLock);
         return "OK";
     }
-    if ((a == "list" && w.size() == 5) || (a == "deref" && w.size() == 4) || (a == "rules" && w.size() == 3 && w[2] == "off")) {
+    if ((a == "list" && w.size() == 5) || (a == "deref" && w.size() == 4) || (a == "field" && w.size() == 3) ||
+        (a == "rules" && w.size() == 3 && w[2] == "off")) {
         AcquireSRWLockExclusive(&g_recLock);
         if (a == "rules") g_recRules.erase(w[1]);
+        else if (a == "field") {
+            int off = (int)strtol(w[2].c_str(), nullptr, 0);
+            bool ok = off >= 0 && off <= 0x1000;
+            if (ok) g_recRules[w[1]].push_back(RecRule{ 'F', off, 0, 0 });
+            ReleaseSRWLockExclusive(&g_recLock);
+            return ok ? "OK" : "FAIL offset must be 0..0x1000";
+        }
         else {
             RecRule r{ a == "list" ? 'L' : 'D', (int)strtol(w[2].c_str(), nullptr, 0), (int)strtol(w[3].c_str(), nullptr, 0),
                        a == "list" ? (int)strtol(w[4].c_str(), nullptr, 0) : 0 };

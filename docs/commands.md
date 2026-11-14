@@ -121,7 +121,7 @@ named in the main README.
 | command | does |
 |---|---|
 | `bridge.cmdlog [on \| off \| dump \| sample CLASS [N]]` | with `on`, points the Execute slot (vtable slot 10) of every `CCommand` class at a counter, so every command the game runs (player and AI: fronts, battle plans, production...) is counted by class; `dump` returns `Class=count` and clears. The first of each class from each caller, and the next N of a class after `sample`, go to the log: caller, fields that read as country ids (`+0x30=ITA`), first 0x88 bytes, and each handle the command holds with its object's class and country fields. Queued commands (AI and player) all run from one caller |
-| `bridge.cmdrec [on [PATH] \| off \| mark TEXT \| skip CLASS.. \| unskip CLASS.. \| owner TYPE HEXOFF[.HEXOFF..] \| list CLASS PTR COUNT STRIDE \| deref CLASS PTR FIELD \| rules CLASS off]` | with `on`, writes every executed command to a file (default `command_record.tsv` in the HOI4 folder); format below |
+| `bridge.cmdrec [on [PATH] \| off \| mark TEXT \| skip CLASS.. \| unskip CLASS.. \| owner TYPE HEXOFF[.HEXOFF..] \| list CLASS PTR COUNT STRIDE \| deref CLASS PTR FIELD \| field CLASS OFF \| rules CLASS off]` | with `on`, writes every executed command to a file (default `command_record.tsv` in the HOI4 folder); format below |
 | `bridge.snap LABEL TYPE [class=CName] FIELD...` | appends a `#snap` line and then one line per object of handle TYPE (of that class) to `unit_snapshots.tsv` in the HOI4 folder: its id and each FIELD. `bridge.snap reset [PATH]` empties the file (or picks another) |
 | `bridge.object TYPE ID` | the game object a handle `{TYPE, ID}` names (commands refer to objects this way; type 53 is an order, i.e. a front or battle plan): its class and the fields that read as country ids |
 | `bridge.mem ADDR LEN` | LEN (up to 0x1000) bytes at hex ADDR as hex, `?` for unreadable ones. `bridge.object` gives an object's address, and the fields of it that point to objects with their class (`P+0x1e0=CProvince`) |
@@ -135,7 +135,7 @@ One tab-separated line per executed command: sequence, ms, class, owner tag, how
 
 - The owner comes from a `cmdblock` rule for the class, else the first handle whose type has a known owner offset (`owner TYPE HEXOFF[.HEXOFF..]`, every offset but the last followed as a pointer). Defaults: 51 division at +0x1c8, 53 order at +0x3c, 67 theatre via its first army `80.0.3c`.
 - `mark TEXT` writes a `#mark` line. A client can stamp the game date with it (e.g. from `bridge.query` with `[GetDateText]`).
-- A last column holds data behind pointers: the class of each pointer that leads to an object (`P+0x40=CX`), and per-class rules: `list CLASS PTR COUNT STRIDE` (a vector: `L+0x28=[51:3,51:9]`) and `deref CLASS PTR FIELD` (`D+0x40=CProvince.0xa4=6325`). `rules CLASS off` removes them.
+- A last column holds data behind pointers: the class of each pointer that leads to an object (`P+0x40=CX`), and per-class rules: `list CLASS PTR COUNT STRIDE` (a vector: `L+0x28=[51:3,51:9]`) `deref CLASS PTR FIELD` (`D+0x40=CProvince.0xa4=6325`) and `field CLASS OFF` (the int at +OFF of the command itself, also past the first 0xa0 bytes: `F+0xe8=1`). `rules CLASS off` removes them.
 - Built in: the move target (`CMove`), the division lists of order assign/unassign, the two lists of a new front.
 
 ### `bridge.snap` fields
