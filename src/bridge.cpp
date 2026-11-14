@@ -1090,7 +1090,9 @@ static bool RawWarPair(uint8_t* action, char a[16], char b[16]) {
 // Every player or AI action is a CCommand subclass; vtable slot 9 checks it, slot 10 (Execute(this)) carries it out.
 // All queued commands, the AI's and the player's, are executed by the command queue (hoi4+0x22c6d10 in 1.19.4).
 // The first bridge.cmdlog / bridge.cmdblock call finds every class whose RTTI name ends in "Command" and whose
-// vtable has CCommand's base slots, and points its slot 10 at hk_cmdExec.
+// vtable has CCommand's base slots, and points its slot 10 at hk_cmdExec. A class in a namespace counts too and
+// keeps it in its name (CMarketStockpileEquipmentTransferCommand@NInternationalMarket, CUnlockSubDoctrineCommand@
+// NDoctrines).
 //
 // A command holds no sender. It names game objects by handle, {int type, int id} (type 0x35 = an order: front or
 // battle plan), which Resolve(&handle) turns into the object; the country follows from that object's owner.
@@ -1249,10 +1251,12 @@ static unsigned long long g_recSeq = 0, g_recStart = 0;
 // Per-class rules for data behind pointers (a last column, "-" if none):
 //   list:  a vector, data pointer at +off, int count at +b, elements of c bytes -> "L+0x28=[51:3,51:9]"
 //          (each element as its 4-byte ints joined by ':'; at most 64 elements)
-//   deref: an object pointer at +off, the int at +b of it -> "D+0x40=CProvince.0xa4=6325"
+//   deref: an object pointer at +off, the int at +b of it -> "D+0x40=CProvince.0xa4=6325". FIELD may be a path,
+//          "0.c": every hex offset but the last is a pointer to follow -> "D+0x48=CEquipmentVariant.0.0xc=1817"
+//          (the class is that of the last object reached)
 //   field: the int at +off of the command itself, also past the recorded bytes -> "F+0xe8=1"
 // The column also names the class of every pointer in the command that leads to an object with RTTI ("P+0x40=CX").
-struct RecRule { char kind; int off, b, c; };
+struct RecRule { char kind; int off, b, c; int path[3] = {}; int np = 0; };   // path: deref's pointers to follow
 static std::map<std::string, std::vector<RecRule>> g_recRules = {
     // CMoveCommand embeds a CUnitMoveAction at +0x28: army handle at +0x38, province ids (the path; the last one is
     // the destination) at +0x40 with count +0x4c, a second province list at +0x58 / +0x64
@@ -1281,8 +1285,16 @@ static std::string RecExtra(const void* self, const uint8_t* bytes, const std::v
         uint8_t* p = *(uint8_t* const*)(bytes + r.off);
         if (r.kind == 'D') {
             int v;
+            std::string path;
+            for (int k = 0; p && k < r.np; k++) {
+                char s[16];
+                snprintf(s, sizeof s, "%x.", r.path[k]);
+                path += s;
+                if (!RawBytes(p + r.path[k], (uint8_t*)&p, 8)) p = nullptr;
+            }
+            if (!p) continue;
             if (!RawClassName(p, cls)) strcpy_s(cls, "?");
-            if (RawBytes(p + r.b, (uint8_t*)&v, 4)) { snprintf(b, sizeof b, " D+%#x=%s.%#x=%d", r.off, cls, r.b, v); out += b; }
+            if (RawBytes(p + r.b, (uint8_t*)&v, 4)) { snprintf(b, sizeof b, " D+%#x=%s.%s%#x=%d", r.off, cls, path.c_str(), r.b, v); out += b; }
         } else if (r.kind == 'L') {
             int n = *(const int*)(bytes + r.b);
             if (n < 0 || n > 64 || r.c < 4 || r.c > 64) continue;
@@ -1465,7 +1477,10 @@ static int PatchCommandVtables() {
         name.resize(at);
         // "...Commands" too: COrderRemoveRootCommands, COrderReplaceRootCommands, COrderReplaceFallbackCommands
         // (battle plan commands that run other commands' Execute directly); the vtable check below keeps CCommands only
-        auto endsWith = [&](const char* s) { size_t n = strlen(s); return name.size() > n && name.compare(name.size() - n, n, s) == 0; };
+        // A class in a namespace is "CMarketStockpileClearCommand@NInternationalMarket": the suffix is checked on the
+        // class name before the first '@'; the record keeps the full name.
+        std::string cls = name.substr(0, name.find('@'));
+        auto endsWith = [&](const char* s) { size_t n = strlen(s); return cls.size() > n && cls.compare(cls.size() - n, n, s) == 0; };
         if (name == "CCommand") baseCol = p;
         else if (endsWith("Command") || endsWith("Commands") || name == "CPauseGame") cols[p] = name;  // bridge.pause
     }
@@ -1815,7 +1830,19 @@ static std::string CmdRecCommand(const std::string& args) {
         else {
             RecRule r{ a == "list" ? 'L' : 'D', (int)strtol(w[2].c_str(), nullptr, 0), (int)strtol(w[3].c_str(), nullptr, 0),
                        a == "list" ? (int)strtol(w[4].c_str(), nullptr, 0) : 0 };
-            bool ok = r.off >= 0 && r.off + 8 <= (int)kRecBytes && (r.kind == 'D' || (r.b >= 0 && r.b + 4 <= (int)kRecBytes));
+            if (r.kind == 'D') {   // FIELD "0.c": hex offsets, all but the last followed as pointers
+                std::vector<int> offs;
+                for (size_t i = 0; i <= w[3].size();) {
+                    size_t j = w[3].find('.', i);
+                    if (j == std::string::npos) j = w[3].size();
+                    offs.push_back((int)strtol(w[3].substr(i, j - i).c_str(), nullptr, w[3].find('.') == std::string::npos ? 0 : 16));
+                    i = j + 1;
+                }
+                if (offs.size() > 4) offs.resize(0);
+                for (size_t k = 0; k + 1 < offs.size(); k++) r.path[r.np++] = offs[k];
+                r.b = offs.empty() ? -1 : offs.back();
+            }
+            bool ok = r.off >= 0 && r.off + 8 <= (int)kRecBytes && (r.kind == 'D' ? r.b >= 0 : (r.b >= 0 && r.b + 4 <= (int)kRecBytes));
             if (ok) g_recRules[w[1]].push_back(r);
             ReleaseSRWLockExclusive(&g_recLock);
             return ok ? "OK" : "FAIL offsets must lie in the first 0xa0 bytes";

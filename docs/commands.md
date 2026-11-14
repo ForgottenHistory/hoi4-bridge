@@ -135,7 +135,7 @@ One tab-separated line per executed command: sequence, ms, class, owner tag, how
 
 - The owner comes from a `cmdblock` rule for the class, else the first handle whose type has a known owner offset (`owner TYPE HEXOFF[.HEXOFF..]`, every offset but the last followed as a pointer). Defaults: 51 division at +0x1c8, 53 order at +0x3c, 67 theatre via its first army `80.0.3c`.
 - `mark TEXT` writes a `#mark` line. A client can stamp the game date with it (e.g. from `bridge.query` with `[GetDateText]`).
-- A last column holds data behind pointers: the class of each pointer that leads to an object (`P+0x40=CX`), and per-class rules: `list CLASS PTR COUNT STRIDE` (a vector: `L+0x28=[51:3,51:9]`) `deref CLASS PTR FIELD` (`D+0x40=CProvince.0xa4=6325`) and `field CLASS OFF` (the int at +OFF of the command itself, also past the first 0xa0 bytes: `F+0xe8=1`). `rules CLASS off` removes them.
+- A last column holds data behind pointers: the class of each pointer that leads to an object (`P+0x40=CX`), and per-class rules: `list CLASS PTR COUNT STRIDE` (a vector: `L+0x28=[51:3,51:9]`) `deref CLASS PTR FIELD` (`D+0x40=CProvince.0xa4=6325`; FIELD can be a path of hex offsets, every one but the last followed as a pointer: `deref C 0x48 0.c` reads the int at +0xc of the object the first element of the vector at +0x48 points to, `D+0x48=CEquipmentVariant.0.0xc=1817`) and `field CLASS OFF` (the int at +OFF of the command itself, also past the first 0xa0 bytes: `F+0xe8=1`). `rules CLASS off` removes them.
 - Built in: the move target (`CMove`), the division lists of order assign/unassign, the two lists of a new front.
 
 ### `bridge.snap` fields
